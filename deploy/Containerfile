@@ -1,0 +1,27 @@
+FROM docker.io/library/ubuntu:24.04 AS bpf-build
+RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+    clang gcc make libbpf-dev libelf-dev libc6-dev linux-libc-dev && rm -rf /var/lib/apt/lists/*
+COPY agent/watch.bpf.c agent/wire.h agent/Makefile /build/
+RUN make -C /build watch.bpf.o
+
+FROM docker.io/library/golang:1.26.5-bookworm AS go-build
+WORKDIR /src
+COPY go.mod go.sum ./
+RUN go mod download
+COPY cmd ./cmd
+COPY internal ./internal
+RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/vhost-watch ./cmd/vhost-watch && \
+    CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/vhost-fault ./cmd/vhost-fault
+
+FROM docker.io/library/ubuntu:24.04 AS fault
+RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+    gcc-12 make binutils libc6-dev libelf-dev && rm -rf /var/lib/apt/lists/*
+COPY --from=go-build /out/vhost-fault /vhost-fault
+COPY --from=bpf-build /build/watch.bpf.o /watch.bpf.o
+COPY fault-injection/host/ /fault-source/
+ENTRYPOINT ["/vhost-fault"]
+
+FROM scratch AS agent
+COPY --from=go-build /out/vhost-watch /vhost-watch
+COPY --from=bpf-build /build/watch.bpf.o /watch.bpf.o
+ENTRYPOINT ["/vhost-watch"]

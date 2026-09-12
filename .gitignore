@@ -1,0 +1,26 @@
+__pycache__/
+*.pyc
+*.o
+*.so
+*.ko
+*.mod
+*.mod.c
+.*.cmd
+Module.symvers
+modules.order
+bin/
+!go.mod
+
+# Local lab history and investigation artifacts are not part of the tool release.
+/AGENTS.md
+/backlog/
+/backlog.config.yml
+/evidence/
+/docs/
+/tools/
+/tests/
+/agent/agent.py
+/agent/native.c
+/fault-injection/drop_notify.c
+/fault-injection/Makefile
+/vhost-watch-go
