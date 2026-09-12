@@ -7,29 +7,26 @@ The agent runs in a container on the QEMU Host. It supports multiple QEMU PIDs, 
 ## Requirements
 
 - Linux x86-64, QEMU with vhost-net, little-endian split virtqueues, and kernel BTF (`/sys/kernel/btf`). Packed rings and IOMMU-translated rings are unsupported.
-- Rootful Podman, Host PID namespace, and permission to use BPF, `pidfd_getfd`, and `process_vm_readv`. The supplied launchers use privileged containers.
+- Rootful Podman, Host PID namespace, and permission to use BPF, `pidfd_getfd`, and `process_vm_readv`. The examples use privileged containers.
 - For domain regex selection, mount the libvirt runtime XML directory (normally `/run/libvirt/qemu`). This is read-only discovery and requires no libvirt socket access.
 - For fault injection, matching Host kernel headers under `/lib/modules` and `/usr/src`, loadable kernel modules, and a matching compiler. The fault image includes GCC 12; the verified kernel is Ubuntu `6.8.0-52-generic`. Other kernels require validation of their vhost internals. Kernel lockdown or module-signing policy may prevent injection.
 
-The current repository and GHCR packages are private. Authenticate before pulling with a token authorized to read these packages:
+The current repository and GHCR packages are private. Log in using a GitHub token with `read:packages` access as the password when prompted:
 
 ```sh
-# Read GHCR_TOKEN from your credential manager; do not put the token in this file.
-printf '%s' "$GHCR_TOKEN" | sudo podman login ghcr.io -u YOUR_GITHUB_USER --password-stdin
+sudo podman login ghcr.io -u YOUR_GITHUB_USER
 sudo podman pull ghcr.io/yckao/virtio-net-recovery:main
 sudo podman pull ghcr.io/yckao/virtio-net-recovery-fault:main
 ```
 
 ## Select and inspect VMs
 
-Run the supplied launchers on the Host. `--pid` accepts repeated flags or a comma-separated list. Explicit PIDs and regex matches form a deduplicated union. Regex uses Go syntax; anchor it when selecting exact names.
+Run these one-line commands directly on the QEMU Host; no launcher scripts or repository checkout are needed. Create the shared state directory once with `sudo mkdir -p /var/lib/vhost-watch`. `--pid` accepts repeated flags or a comma-separated list. Explicit PIDs and regex matches form a deduplicated union. Regex uses Go syntax; anchor it when selecting exact names.
 
 ```sh
-sudo env VHOST_WATCH_NAME=vhost-list ./deploy/run.sh \
-  --domain-regex '^worker-' --list
+sudo podman run --rm --name vhost-list --privileged --pid=host --network=none --read-only --security-opt label=disable -v /run/libvirt/qemu:/run/libvirt/qemu:ro ghcr.io/yckao/virtio-net-recovery:main --domain-regex '^worker-' --list
 
-sudo env VHOST_WATCH_NAME=vhost-queues ./deploy/run.sh \
-  --pid 1234 --list-queues
+sudo podman run --rm --name vhost-queues --privileged --pid=host --network=none --read-only --security-opt label=disable -v /sys/kernel/btf:/sys/kernel/btf:ro -v /var/lib/vhost-watch:/state:rw ghcr.io/yckao/virtio-net-recovery:main --pid 1234 --list-queues
 ```
 
 `--list-queues` reports the current QEMU `vhost_fd` for each configured TX slot. A vhost FD is process-local and can change after restart or device reconfiguration; it is not a guest queue number. Select it from a fresh listing.
@@ -39,14 +36,13 @@ sudo env VHOST_WATCH_NAME=vhost-queues ./deploy/run.sh \
 Observe without writing recovery kicks:
 
 ```sh
-sudo ./deploy/run.sh --detach --pid 1234,5678 --mode observe
+sudo podman run --detach --rm --name vhost-watch --privileged --pid=host --network=none --read-only --security-opt label=disable -v /sys/kernel/btf:/sys/kernel/btf:ro -v /var/lib/vhost-watch:/state:rw --log-driver=k8s-file --log-opt=max-size=10mb ghcr.io/yckao/virtio-net-recovery:main --pid 1234,5678 --mode observe
 ```
 
 Enable guarded recovery for matching domains:
 
 ```sh
-sudo ./deploy/run.sh --detach --domain-regex '^worker-' \
-  --mode guarded --batch-rings --interval 0.02 --threshold 0.04
+sudo podman run --detach --rm --name vhost-watch --privileged --pid=host --network=none --read-only --security-opt label=disable -v /sys/kernel/btf:/sys/kernel/btf:ro -v /var/lib/vhost-watch:/state:rw --log-driver=k8s-file --log-opt=max-size=10mb -v /run/libvirt/qemu:/run/libvirt/qemu:ro ghcr.io/yckao/virtio-net-recovery:main --domain-regex '^worker-' --mode guarded --batch-rings --interval 0.02 --threshold 0.04
 ```
 
 The example checks ring progress every 20 ms, then confirms a suspected stall against live vhost state twice before writing. A shared BPF snapshot probe serves all selected VMs. Recovery verifies the current QEMU process, vhost attachment, and eventfd identity. It then checks for consumed/used progress. This confirms Host queue progress; service health needs a separate application check.
@@ -65,15 +61,13 @@ sudo podman stop --time 10 vhost-watch
 Write one verified kick to every selected TX slot and exit:
 
 ```sh
-sudo env VHOST_WATCH_NAME=vhost-recovery ./deploy/run.sh \
-  --domain-regex '^worker-' --once
+sudo podman run --rm --name vhost-recovery --privileged --pid=host --network=none --read-only --security-opt label=disable -v /sys/kernel/btf:/sys/kernel/btf:ro -v /var/lib/vhost-watch:/state:rw -v /run/libvirt/qemu:/run/libvirt/qemu:ro ghcr.io/yckao/virtio-net-recovery:main --domain-regex '^worker-' --once
 ```
 
 Restrict manual recovery to one current TX slot in one VM:
 
 ```sh
-sudo env VHOST_WATCH_NAME=vhost-recovery ./deploy/run.sh \
-  --pid 1234 --once --vhost-fd 42
+sudo podman run --rm --name vhost-recovery --privileged --pid=host --network=none --read-only --security-opt label=disable -v /sys/kernel/btf:/sys/kernel/btf:ro -v /var/lib/vhost-watch:/state:rw ghcr.io/yckao/virtio-net-recovery:main --pid 1234 --once --vhost-fd 42
 ```
 
 `--once` deliberately bypasses stall detection and the observer lock, so it can run alongside an observing agent. It reports per-target results as JSON and exits nonzero for unavailable targets or failed writes. A successful write is not proof that application traffic recovered.
@@ -86,8 +80,7 @@ Use a test VM with active guest TX traffic. Keep an independent management path 
 2. Start the fault container, selecting exactly one VM and one FD:
 
 ```sh
-sudo ./deploy/fault.sh --detach --pid 1234 --vhost-fd 42 \
-  --delay 2s --window 500ms --drops 1 --recover-after 30s
+sudo podman run --detach --rm --name vhost-fault --privileged --pid=host --network=none --read-only --security-opt label=disable --tmpfs /tmp:rw,size=256m -v /lib/modules:/lib/modules:ro -v /usr/src:/usr/src:ro -v /sys/kernel/btf:/sys/kernel/btf:ro -v /var/lib/vhost-watch:/state:rw ghcr.io/yckao/virtio-net-recovery-fault:main --pid 1234 --vhost-fd 42 --delay 2s --window 500ms --drops 1 --recover-after 30s
 sudo podman logs -f vhost-fault
 ```
 
@@ -107,8 +100,8 @@ The controller sends a verified recovery kick on normal stop or when `--recover-
 After a forced kill or controller crash, the kernel window still expires, but the module may remain loaded and retain the target vhost file. Remove it explicitly, then perform manual recovery with a freshly selected PID/FD:
 
 ```sh
-sudo ./deploy/fault.sh --cleanup
-sudo env VHOST_WATCH_NAME=vhost-recovery ./deploy/run.sh --pid 1234 --once
+sudo podman run --rm --name vhost-fault-cleanup --privileged --pid=host --network=none --read-only --security-opt label=disable -v /var/lib/vhost-watch:/state:rw ghcr.io/yckao/virtio-net-recovery-fault:main --cleanup
+sudo podman run --rm --name vhost-recovery --privileged --pid=host --network=none --read-only --security-opt label=disable -v /sys/kernel/btf:/sys/kernel/btf:ro -v /var/lib/vhost-watch:/state:rw ghcr.io/yckao/virtio-net-recovery:main --pid 1234 --once
 ```
 
 `--cleanup` only removes the module; it does not guess a recovery target. A Host permits one fault controller at a time. Do not restart or hot-unplug the selected VM device during an injection experiment.
@@ -122,6 +115,6 @@ sudo podman build --target agent -f deploy/Containerfile -t localhost/vhost-watc
 sudo podman build --target fault -f deploy/Containerfile -t localhost/vhost-fault:dev .
 ```
 
-`make build` requires Go 1.25 or later, Clang, libbpf headers, and a Linux x86-64 build environment. Override `VHOST_WATCH_IMAGE` or `VHOST_FAULT_IMAGE` to run local images. Override `VHOST_WATCH_NAME` for concurrent inspections or one-shot calls.
+`make build` requires Go 1.25 or later, Clang, libbpf headers, and a Linux x86-64 build environment. To use local images, replace the GHCR image reference in a command with the corresponding `localhost/...:dev` tag. Choose a different `--name` when running concurrent inspections or one-shot calls.
 
 GitHub Actions run Go race tests and vet, compile BPF and the Host module, and build both Linux amd64 images. Pushes to `main`, version tags, and manual runs publish to GHCR using `GITHUB_TOKEN`, then pull each digest and verify its revision, CLI, and package visibility. Tags include `main`, full `sha-<commit>`, and version tags for `v*` releases. Private repository publication requires private package visibility; publication does not make either package public.
