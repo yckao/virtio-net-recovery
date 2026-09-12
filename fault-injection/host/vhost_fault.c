@@ -7,6 +7,7 @@
 #include <linux/poll.h>
 #include <linux/workqueue.h>
 #include <linux/ktime.h>
+#include <linux/uaccess.h>
 
 #ifndef CONFIG_X86_64
 #error "This injector supports x86-64 only"
@@ -63,8 +64,34 @@ static int gate(struct kprobe *p, struct pt_regs *regs)
 // Keep the probe unoptimized so argument modification has one predictable path.
 static void gate_post(struct kprobe *p, struct pt_regs *regs, unsigned long flags) {}
 static struct kprobe probe = {
-	.symbol_name = "vhost_poll_wakeup", .pre_handler = gate, .post_handler = gate_post,
+	.pre_handler = gate, .post_handler = gate_post,
 };
+
+static int resolve_gate_address(void)
+{
+	struct kprobe lookup = { .symbol_name = "vhost_poll_wakeup" };
+	u8 bytes[9];
+	unsigned int offset = 0;
+	int err = register_kprobe(&lookup);
+
+	if (err)
+		return err;
+	probe.addr = lookup.addr;
+	err = copy_from_kernel_nofault(bytes, probe.addr, sizeof(bytes));
+	unregister_kprobe(&lookup);
+	if (err)
+		return err;
+	if (!memcmp(bytes, "\xf3\x0f\x1e\xfa", 4))
+		offset = 4; /* ENDBR64 */
+	// Never aggregate our post-handler with entry probes using ftrace. Older
+	// kernels can corrupt that aggregate when post-handler flags change. Skip
+	// the verified five-byte fentry call/NOP, before any argument is consumed.
+	if (bytes[offset] != 0xe8 &&
+	    memcmp(bytes + offset, "\x0f\x1f\x44\x00\x00", 5))
+		return -EOPNOTSUPP;
+	probe.addr += offset + 5;
+	return 0;
+}
 
 static void disarm(struct work_struct *work)
 {
@@ -93,6 +120,11 @@ static int __init fault_init(void)
 	// prevents its selected waiter address from being reused during injection.
 	pinned_file = get_file(fd.file);
 	fdput(fd);
+	err = resolve_gate_address();
+	if (err) {
+		fput(pinned_file);
+		return err;
+	}
 	starts_ns = ktime_get_ns() + (u64)delay_ms * NSEC_PER_MSEC;
 	ends_ns = starts_ns + (u64)window_ms * NSEC_PER_MSEC;
 	err = register_kprobe(&probe);

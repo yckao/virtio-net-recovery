@@ -21,3 +21,5 @@ fault-injection/Makefile
 **/Module.symvers
 **/modules.order
 bin
+
+!go.mod
