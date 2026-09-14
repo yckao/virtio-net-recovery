@@ -9,7 +9,7 @@ The agent runs in a container on the QEMU Host. It supports multiple QEMU PIDs, 
 - Linux x86-64, QEMU with vhost-net, little-endian split virtqueues, and kernel BTF (`/sys/kernel/btf`). Packed rings and IOMMU-translated rings are unsupported.
 - Rootful Podman, Host PID namespace, and permission to use BPF, `pidfd_getfd`, and `process_vm_readv`. The examples use privileged containers.
 - For domain regex selection, mount the libvirt runtime XML directory (normally `/run/libvirt/qemu`). This is read-only discovery and requires no libvirt socket access.
-- For fault injection, matching Host kernel headers under `/lib/modules` and `/usr/src`, loadable kernel modules, and a matching compiler. The fault image includes GCC 12; the verified kernel is Ubuntu `6.8.0-52-generic`. Other kernels require validation of their vhost internals. Kernel lockdown or module-signing policy may prevent injection.
+- For fault injection, matching Host kernel headers under `/lib/modules` and `/usr/src`, loadable kernel modules, and a matching compiler. The fault image includes GCC 12; supported Host kernels include Ubuntu `6.8.0-52-generic` and `6.17.0-20-generic`. Other kernels require validation of their vhost internals. Kernel lockdown or module-signing policy may prevent injection.
 
 The current repository and GHCR packages are private. Log in using a GitHub token with `read:packages` access as the password when prompted:
 

@@ -102,24 +102,29 @@ static DECLARE_DELAYED_WORK(disarm_work, disarm);
 
 static int __init fault_init(void)
 {
-	struct fd fd;
+	struct file *file;
 	int err;
 
 	if (!target_wait || target_fd < 0 || delay_ms > 60000 ||
 	    !window_ms || window_ms > 60000 || !max_drops || max_drops > 1000000)
 		return -EINVAL;
-	fd = fdget(target_fd);
-	if (!fd.file)
+	/*
+	 * fget() works with both the traditional struct fd and the word-backed
+	 * struct fd used by newer kernels.  Do not inspect struct fd internals:
+	 * they are intentionally hidden on kernels such as Ubuntu's 6.17 build.
+	 * The reference returned here also supplies the pin needed for injection.
+	 */
+	file = fget(target_fd);
+	if (!file)
 		return -EBADF;
-	if (!S_ISCHR(file_inode(fd.file)->i_mode) || !fd.file->f_op->owner ||
-	    strcmp(module_name(fd.file->f_op->owner), "vhost_net")) {
-		fdput(fd);
+	if (!S_ISCHR(file_inode(file)->i_mode) || !file->f_op->owner ||
+	    strcmp(module_name(file->f_op->owner), "vhost_net")) {
+		fput(file);
 		return -EINVAL;
 	}
 	// Retain the vhost allocation even if the controller is killed. This
 	// prevents its selected waiter address from being reused during injection.
-	pinned_file = get_file(fd.file);
-	fdput(fd);
+	pinned_file = file;
 	err = resolve_gate_address();
 	if (err) {
 		fput(pinned_file);
