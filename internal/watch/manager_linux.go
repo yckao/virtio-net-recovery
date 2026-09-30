@@ -105,18 +105,9 @@ func RunSelected(ctx context.Context, cfg ManagerConfig, output io.Writer) error
 	if base.Mode == "trace" {
 		// Capture this process generation set once. Regex selection does not
 		// attach replacement/new VMs during a bounded diagnostic session.
-		done := make(chan error, len(targets))
-		for _, t := range targets {
-			c := policy(t)
-			go func() { done <- RunWithBPF(ctx, c, writer, bpf) }()
-		}
-		failures := len(problems)
-		for range targets {
-			if err := <-done; err != nil {
-				failures++
-				log.emit("target_failed", map[string]any{"error": err.Error()})
-			}
-		}
+		failures := len(problems) + runTraceTargets(targets, func(t selection.Target) error {
+			return RunWithBPF(ctx, policy(t), writer, bpf)
+		}, log)
 		if err := traceOutput.Err(); err != nil {
 			return err
 		}
@@ -250,4 +241,26 @@ func RunSelected(ctx context.Context, cfg ManagerConfig, output io.Writer) error
 			log.emit("target_unavailable", map[string]any{"error": e.Error()})
 		}
 	}
+}
+
+// runTraceTargets retains the source target across concurrent completions,
+// including failures that happen before a worker can emit its started record.
+func runTraceTargets(targets []selection.Target, run func(selection.Target) error, log *logger) int {
+	type result struct {
+		target selection.Target
+		err    error
+	}
+	done := make(chan result, len(targets))
+	for _, target := range targets {
+		go func() { done <- result{target: target, err: run(target)} }()
+	}
+	failures := 0
+	for range targets {
+		r := <-done
+		if r.err != nil {
+			failures++
+			log.emit("target_failed", map[string]any{"pid": r.target.PID, "domain": r.target.Domain, "error": r.err.Error()})
+		}
+	}
+	return failures
 }
