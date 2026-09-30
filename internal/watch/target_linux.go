@@ -105,12 +105,15 @@ func (t *Target) Duplicate(fd int) (int, error) { return unix.PidfdGetfd(t.pidfd
 func eventID(pid string, fd int) (uint32, error) {
 	data, err := os.ReadFile(fmt.Sprintf("/proc/%s/fdinfo/%d", pid, fd))
 	if err != nil {
-		return 0, err
+		return 0, &observationError{Err: err}
 	}
 	for _, line := range strings.Split(string(data), "\n") {
 		key, value, found := strings.Cut(line, ":")
 		if found && key == "eventfd-id" {
 			id, err := strconv.ParseUint(strings.TrimSpace(value), 10, 32)
+			if err != nil {
+				err = &observationError{Err: err}
+			}
 			return uint32(id), err
 		}
 	}
@@ -182,6 +185,20 @@ type KickWriteError struct{ Err error }
 func (e *KickWriteError) Error() string { return fmt.Sprintf("eventfd kick write: %v", e.Err) }
 func (e *KickWriteError) Unwrap() error { return e.Err }
 
+// observationError marks a failed read, separately from a safety refusal.
+type observationError struct{ Err error }
+
+func (e *observationError) Error() string { return e.Err.Error() }
+func (e *observationError) Unwrap() error { return e.Err }
+
+func isObservationError(err error) bool {
+	var readErr *observationError
+	var writeErr *KickWriteError
+	return errors.As(err, &readErr) && !errors.As(err, &writeErr) &&
+		!errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) &&
+		!errors.Is(err, ErrKickIdentityChanged)
+}
+
 // ErrKickIdentityChanged marks an observed identity mismatch, separately from
 // an unavailable snapshot or failure to read/duplicate a descriptor.
 var ErrKickIdentityChanged = errors.New("kick identity changed")
@@ -207,7 +224,7 @@ func RekickContext(ctx context.Context, target recoveryTarget, bpf snapshotter, 
 	}
 	fd, err := target.Duplicate(slices.Min(candidates))
 	if err != nil {
-		return err
+		return &observationError{Err: err}
 	}
 	defer unix.Close(fd)
 	id, err := eventID("self", fd)
@@ -219,14 +236,14 @@ func RekickContext(ctx context.Context, target recoveryTarget, bpf snapshotter, 
 	}
 	flags, err := unix.FcntlInt(uintptr(fd), unix.F_GETFL, 0)
 	if err != nil {
-		return err
+		return &observationError{Err: err}
 	}
 	if flags&unix.O_NONBLOCK == 0 {
 		return errors.New("refusing a potentially blocking eventfd write")
 	}
 	current, err := bpf.Snapshot(vhostFD)
 	if err != nil {
-		return err
+		return &observationError{Err: err}
 	}
 	if err = current.Validate(); err != nil {
 		return err

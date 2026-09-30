@@ -131,11 +131,12 @@ func runRecover(ctx context.Context, c Config, target *Target, bpf *BPF, l *logg
 	discoveryFailures := map[int]string{}
 	var metricsPending bool
 	var metricsErrors uint64
+	var metricsLiveReadFailed bool
 	var metricsGap float64
 	var metricsSampled int
 	finishMetrics := func() {
 		if metricsPending {
-			recordRecoveryMetrics(c.metricWorker, known, discoveryFailures, metricsSampled, metricsGap, pollErrors > metricsErrors)
+			recordRecoveryMetrics(c.metricWorker, known, discoveryFailures, metricsSampled, metricsGap, pollErrors > metricsErrors || metricsLiveReadFailed)
 			metricsPending = false
 		}
 	}
@@ -197,6 +198,7 @@ func runRecover(ctx context.Context, c Config, target *Target, bpf *BPF, l *logg
 			return l.err
 		}
 		metricsPending, metricsErrors, metricsSampled = true, pollErrors, 0
+		metricsLiveReadFailed = false
 		alive, err := target.CheckAlive()
 		if err != nil {
 			pollErrors++
@@ -365,6 +367,7 @@ func runRecover(ctx context.Context, c Config, target *Target, bpf *BPF, l *logg
 								if ctx.Err() != nil {
 									return l.err
 								}
+								metricsLiveReadFailed = metricsLiveReadFailed || isObservationError(err)
 								event := "recovery_refused"
 								var writeErr *KickWriteError
 								if errors.As(err, &writeErr) {
@@ -498,7 +501,7 @@ func recoverLive(ctx context.Context, c Config, target liveQueueTarget, bpf snap
 	}()
 	s, row, err := liveRow(target, bpf, q.fd)
 	if err != nil {
-		return err
+		return &observationError{Err: err}
 	}
 	if s.Identity() != q.snapshot.Identity() {
 		metricDecision = ReasonIdentityChange
@@ -559,7 +562,7 @@ func recoverLive(ctx context.Context, c Config, target liveQueueTarget, bpf snap
 	if err != nil {
 		metricDecision = ReasonUnavailable
 		q.decision(EpisodeReasonUnavailable)
-		return err
+		return &observationError{Err: err}
 	}
 	if !slices.Contains(vhosts, q.fd) {
 		metricDecision = ReasonIdentityChange
@@ -570,7 +573,7 @@ func recoverLive(ctx context.Context, c Config, target liveQueueTarget, bpf snap
 	if err != nil {
 		metricDecision = ReasonUnavailable
 		q.decision(EpisodeReasonUnavailable)
-		return err
+		return &observationError{Err: err}
 	}
 	defer unix.Close(fd)
 	if q.policy.verification == nil {
