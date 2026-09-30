@@ -245,6 +245,34 @@ func TestEpisodeDeadlineAndReopenBoundDoNotDependOnPollAvailability(t *testing.T
 	}
 }
 
+func TestEpisodeOpenForWriteRequiresSampleAndPreservesActiveOrigin(t *testing.T) {
+	j, now, records := episodeFixture()
+	if j.OpenForWrite(EpisodeReasonCandidate) || j.Active() || len(*records) != 0 {
+		t.Fatal("first-write exception opened without a sampled origin")
+	}
+	j.Observe(episodeSample(0, 20), true)
+	if !j.Open(EpisodeReasonCandidate) {
+		t.Fatal("sampled candidate did not open")
+	}
+	oldID := j.EventID()
+	if j.OpenForWrite(EpisodeReasonCandidate) || j.EventID() != oldID || len(*records) != 1 {
+		t.Fatal("first-write exception replaced an active origin or emitted a duplicate")
+	}
+	j.Close(EpisodeOutcomeQuiet)
+	*now = EpisodeReopenDelay / 2
+	j.Observe(episodeSample(*now, 21), true)
+	if j.Open(EpisodeReasonCandidate) || len(*records) != 2 {
+		t.Fatal("ordinary reopening bypassed cooldown")
+	}
+	if !j.OpenForWrite(EpisodeReasonCandidate) || j.EventID() == "" || j.EventID() == oldID {
+		t.Fatal("first write during cooldown did not receive a fresh active origin")
+	}
+	opening := (*records)[len(*records)-1]
+	if len(*records) != 3 || opening.event != "candidate" || opening.fields["event_id"] != j.EventID() {
+		t.Fatal("first-write exception did not emit its own candidate origin")
+	}
+}
+
 func TestEpisodeTimeoutObserveIncludesCurrentSample(t *testing.T) {
 	j, now, records := episodeFixture()
 	j.Observe(episodeSample(0, 20), true)

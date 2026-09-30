@@ -2,7 +2,6 @@ package watch
 
 import (
 	"crypto/rand"
-	"encoding/hex"
 	"strconv"
 	"sync/atomic"
 	"time"
@@ -81,13 +80,7 @@ const (
 )
 
 var (
-	episodePrefix = func() string {
-		var prefix [12]byte
-		if _, err := rand.Read(prefix[:]); err != nil {
-			panic(err)
-		}
-		return hex.EncodeToString(prefix[:])
-	}()
+	episodePrefix   = rand.Text()
 	episodeSequence atomic.Uint64
 	episodeClock    = time.Now()
 )
