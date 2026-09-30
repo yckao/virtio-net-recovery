@@ -49,23 +49,33 @@ func runRecover(ctx context.Context, c Config, target *Target, bpf *BPF, l *logg
 	discoveryFailures := map[int]string{}
 	summary := func(now float64) map[string]any {
 		rows := make([]map[string]any, 0, len(known))
-		active := map[int]bool{}
-		for _, q := range queues {
-			active[q.fd] = batch != nil
+		knownFDs, sampledFDs := make([]int, 0, len(known)), []int{}
+		for fd := range known {
+			knownFDs = append(knownFDs, fd)
 		}
-		unavailable := 0
+		if batch != nil {
+			for _, q := range queues {
+				sampledFDs = append(sampledFDs, q.fd)
+			}
+		}
+		unavailable := unavailableRecoveryFDs(knownFDs, sampledFDs, discoveryFailures)
 		for _, q := range known {
 			row := q.summary(now)
 			row["coverage"] = "sampled"
-			if !active[q.fd] {
+			if slices.Contains(unavailable, q.fd) {
 				row["coverage"] = "unavailable"
-				unavailable++
 			}
 			rows = append(rows, row)
 		}
+		for _, fd := range unavailable {
+			if known[fd] == nil {
+				rows = append(rows, map[string]any{"vhost_fd": fd, "coverage": "unavailable",
+					"error": discoveryFailures[fd], "previously_supported": false})
+			}
+		}
 		return map[string]any{"attempts": attempts, "writes": writes, "refusals": refusals,
 			"poll_errors": pollErrors, "max_poll_gap": max(maxPollGap, now-lastPoll), "max_loop_gap": maxLoopGap,
-			"queues": rows, "unavailable_queues": unavailable, "source": "cached_user_indices"}
+			"queues": rows, "unavailable_queues": len(unavailable), "source": "cached_user_indices"}
 	}
 	defer func() { l.emit("stopped", summary(monotonic())) }()
 	ticker := time.NewTicker(time.Duration(c.Interval * float64(time.Second)))
@@ -167,6 +177,7 @@ func runRecover(ctx context.Context, c Config, target *Target, bpf *BPF, l *logg
 						delete(discoveryFailures, fd)
 					}
 				}
+				pruneRecoveryPolicies(policies, vhosts)
 				batch = nil
 				if len(snapshots) != 0 {
 					batch, err = NewRingBatch(target, snapshots)
@@ -238,9 +249,6 @@ func runRecover(ctx context.Context, c Config, target *Target, bpf *BPF, l *logg
 							}
 						}
 					}
-					if q.policy.Unconfirmed(now, c.VerifyTimeout) {
-						l.emit("recovery_unconfirmed", q.summary(now))
-					}
 					// Hysteresis suppresses reports only. A new candidate is
 					// always eligible for paced recovery during this quiet period.
 					if q.incident && q.policy.verification == nil && q.quietSince != 0 && now-q.quietSince >= 1 {
@@ -248,6 +256,13 @@ func runRecover(ctx context.Context, c Config, target *Target, bpf *BPF, l *logg
 						q.incident, q.recoveredReported = false, false
 					}
 				}
+			}
+		}
+		// A loss of coverage must not suspend the original verification deadline.
+		// Preserve the baseline so later live progress can still be observed.
+		for _, q := range known {
+			if q.policy.Unconfirmed(now, c.VerifyTimeout) {
+				l.emit("recovery_unconfirmed", q.summary(now))
 			}
 		}
 		if now-lastSummary >= c.SummaryInterval {

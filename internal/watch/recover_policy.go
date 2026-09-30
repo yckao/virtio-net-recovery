@@ -1,6 +1,9 @@
 package watch
 
-import "math"
+import (
+	"math"
+	"slices"
+)
 
 // RecoveryPolicy uses a single cadence for observation and retry pacing. It
 // has no elapsed-incident deadline or lifetime recovery budget. An attempt is
@@ -113,4 +116,39 @@ func noteDiscoveryFailure(failures map[int]string, fd int, failure string, previ
 	report = failures[fd] != failure
 	failures[fd] = failure
 	return report, previouslySupported && !failedBefore
+}
+
+// pruneRecoveryPolicies retains pacing only for slots in the current inventory.
+// A process that repeatedly replaces slots must not retain historical policies.
+func pruneRecoveryPolicies(policies map[int]*RecoveryPolicy, vhosts []int) {
+	present := make(map[int]bool, len(vhosts))
+	for _, fd := range vhosts {
+		present[fd] = true
+	}
+	for fd := range policies {
+		if !present[fd] {
+			delete(policies, fd)
+		}
+	}
+}
+
+// unavailableRecoveryFDs includes discovery failures even when a slot has never
+// produced a supported snapshot, without counting known failed slots twice.
+func unavailableRecoveryFDs(known, sampled []int, failures map[int]string) []int {
+	unavailable := make(map[int]bool, len(known)+len(failures))
+	for _, fd := range known {
+		unavailable[fd] = true
+	}
+	for fd := range failures {
+		unavailable[fd] = true
+	}
+	for _, fd := range sampled {
+		delete(unavailable, fd)
+	}
+	fds := make([]int, 0, len(unavailable))
+	for fd := range unavailable {
+		fds = append(fds, fd)
+	}
+	slices.Sort(fds)
+	return fds
 }

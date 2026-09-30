@@ -123,3 +123,54 @@ func TestHealthyCompletionRemainsNonCandidate(t *testing.T) {
 		t.Fatal("healthy observation initiated recovery")
 	}
 }
+
+func TestDisappearingSlotsDoNotAccumulatePoliciesOrResetActivePacing(t *testing.T) {
+	active := NewRecoveryPolicy(.1)
+	active.Attempt(1)
+	active.FinishAttempt(1.05)
+	active.Written(1.05, 10, 11)
+	policies := map[int]*RecoveryPolicy{7: active}
+	for fd := 8; fd < 10008; fd++ {
+		policies[fd] = NewRecoveryPolicy(.1)
+		pruneRecoveryPolicies(policies, []int{7})
+		if len(policies) != 1 || policies[7] != active {
+			t.Fatal("slot churn retained historical state or replaced the active policy")
+		}
+	}
+	if active.Attempt(1.14) || active.PendingAge(1.15) < .099 {
+		t.Fatal("pruning historical slots reset active pacing or verification")
+	}
+	pruneRecoveryPolicies(policies, nil)
+	if len(policies) != 0 {
+		t.Fatal("an empty inventory retained policies")
+	}
+}
+
+func TestCoverageIncludesUnsupportedSlotsWithoutDoubleCountingKnownFailures(t *testing.T) {
+	failures := map[int]string{8: "temporarily unavailable", 9: "unsupported ring"}
+	fds := unavailableRecoveryFDs([]int{7, 8}, []int{7}, failures)
+	if len(fds) != 2 || fds[0] != 8 || fds[1] != 9 {
+		t.Fatalf("incomplete or duplicated unavailable coverage: %v", fds)
+	}
+	fds = unavailableRecoveryFDs([]int{7, 8}, nil, failures)
+	if len(fds) != 3 || fds[0] != 7 || fds[1] != 8 || fds[2] != 9 {
+		t.Fatalf("failed batch omitted previously healthy coverage: %v", fds)
+	}
+}
+
+func TestLostCoverageStillReportsTimeoutAndPreservesProgressVerification(t *testing.T) {
+	p := NewRecoveryPolicy(.1)
+	p.Written(1, 10, 11)
+	p.Invalidate(2)
+	if !p.Unconfirmed(6, 5) || p.Unconfirmed(7, 5) || p.PendingAge(7) != 6 {
+		t.Fatal("lost coverage suspended, repeated or erased the original timeout")
+	}
+	if p.Observe(20, 10, 256, 7) || !p.Observe(20, 10, 256, 7.11) || !p.Attempt(7.11) {
+		t.Fatal("timeout disabled recovery after coverage resumed")
+	}
+	p.Written(7.11, 10, 11)
+	latency, confirmed := p.Verify(8, 11, 12)
+	if !confirmed || latency != 7 {
+		t.Fatal("timeout or repeated write lost the original progress baseline")
+	}
+}
