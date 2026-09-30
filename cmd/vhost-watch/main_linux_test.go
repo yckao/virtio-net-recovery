@@ -97,3 +97,42 @@ func TestParseConfigHelpDoesNotRequireSelection(t *testing.T) {
 		t.Fatalf("help error = %v", err)
 	}
 }
+
+func TestParseConfigOriginalReadmeOnceCommands(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		args    []string
+		pids    []int
+		pattern string
+		fd      int
+	}{
+		{"domain recovery", []string{"--domain-regex", "^worker-", "--once"}, nil, "^worker-", -1},
+		{"one TX slot", []string{"--pid", "1234", "--once", "--vhost-fd", "42"}, []int{1234}, "", 42},
+		{"recovery after cleanup", []string{"--pid", "1234", "--once"}, []int{1234}, "", -1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg, err := parseConfig(tc.args)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if cfg.Agent.Mode != "kick" || cfg.Agent.VhostFD != tc.fd || cfg.List || cfg.ListQueues {
+				t.Fatalf("documented once command changed its manual-write policy: %+v", cfg)
+			}
+			if !reflect.DeepEqual(cfg.Selector.PIDs, tc.pids) || cfg.Selector.Pattern != tc.pattern {
+				t.Fatalf("documented once command changed its selection: %+v", cfg.Selector)
+			}
+		})
+	}
+}
+
+func TestParseConfigOnceDurationDoesNotSelectTrace(t *testing.T) {
+	// This covers policy parsing only. The manager's kick path exits before
+	// installing the observe/recover duration timer.
+	cfg, err := parseConfig([]string{"--pid", "1234", "--once", "--duration", "301"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Agent.Mode != "kick" || cfg.Agent.Duration != 301 {
+		t.Fatalf("duration changed the manual-write policy: %+v", cfg.Agent)
+	}
+}

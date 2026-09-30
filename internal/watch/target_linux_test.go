@@ -69,6 +69,60 @@ func TestRekickCancellationAfterLiveSnapshotRefusesWrite(t *testing.T) {
 
 func (b testBPF) Snapshot(int) (Snapshot, error) { return b.value, b.err }
 
+type manualWriteSnapshotter struct {
+	value Snapshot
+	calls int
+}
+
+func (b *manualWriteSnapshotter) Snapshot(int) (Snapshot, error) {
+	b.calls++
+	return b.value, nil
+}
+
+func TestManualWriteAcceptsEmptyRingAndQueuedWork(t *testing.T) {
+	for _, queued := range []bool{false, true} {
+		name := "empty_ring"
+		if queued {
+			name = "empty_ring_with_queued_work"
+		}
+		t.Run(name, func(t *testing.T) {
+			fd, err := unix.Eventfd(0, unix.EFD_CLOEXEC|unix.EFD_NONBLOCK)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer unix.Close(fd)
+			id, err := eventID("self", fd)
+			if err != nil {
+				t.Fatal(err)
+			}
+			// Manual recovery verifies the attachment, without requiring pending
+			// descriptors or interpreting the queued bit as worker idleness.
+			avail, used := [4]byte{0, 0, 10, 0}, [4]byte{0, 0, 10, 0}
+			s := configured()
+			s.EventID, s.LastAvail, s.LastUsed = id, 10, 10
+			s.Avail = uint64(uintptr(unsafe.Pointer(&avail[0])))
+			s.Used = uint64(uintptr(unsafe.Pointer(&used[0])))
+			if queued {
+				s.WorkFlags = 1 << 1
+			}
+			target := &testTarget{source: fd, alive: true}
+			bpf := &manualWriteSnapshotter{value: s}
+			if err := RekickContext(context.Background(), target, bpf, 33, s, map[uint32][]int{id: {66}}); err != nil {
+				t.Fatal(err)
+			}
+			runtime.KeepAlive(&avail)
+			runtime.KeepAlive(&used)
+			if bpf.calls != 1 {
+				t.Fatalf("manual write performed %d snapshots; want only the final pre-write identity check", bpf.calls)
+			}
+			var data [8]byte
+			if n, err := unix.Read(fd, data[:]); err != nil || n != 8 || binary.NativeEndian.Uint64(data[:]) != 1 {
+				t.Fatalf("manual recovery did not write exactly one native-u64 kick: %d %v %v", n, data, err)
+			}
+		})
+	}
+}
+
 func TestVerifiedRekickAndRefusals(t *testing.T) {
 	for _, name := range []string{"valid", "fd_reused", "queue_reconfigured", "process_exited", "blocking", "missing", "snapshot_error", "detached_waiter"} {
 		t.Run(name, func(t *testing.T) {
