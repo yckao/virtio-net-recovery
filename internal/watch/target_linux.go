@@ -3,6 +3,7 @@
 package watch
 
 import (
+	"context"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -177,6 +178,15 @@ type snapshotter interface{ Snapshot(int) (Snapshot, error) }
 // Rekick pins the exact eventfd and revalidates its current vhost attachment.
 // It never changes file flags, so duplicated FDs cannot alter QEMU's flags.
 func Rekick(target recoveryTarget, bpf snapshotter, vhostFD int, s Snapshot, events map[uint32][]int) error {
+	return RekickContext(context.Background(), target, bpf, vhostFD, s, events)
+}
+
+// RekickContext checks cancellation again after the live snapshot and directly
+// before the nonblocking write. Rekick retains the manual API's behavior.
+func RekickContext(ctx context.Context, target recoveryTarget, bpf snapshotter, vhostFD int, s Snapshot, events map[uint32][]int) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	if err := s.Validate(); err != nil {
 		return err
 	}
@@ -212,6 +222,9 @@ func Rekick(target recoveryTarget, bpf snapshotter, vhostFD int, s Snapshot, eve
 	}
 	if current.Identity() != s.Identity() || !target.Alive() {
 		return errors.New("queue identity changed before recovery")
+	}
+	if err := ctx.Err(); err != nil {
+		return err
 	}
 	var data [8]byte
 	binary.NativeEndian.PutUint64(data[:], 1)

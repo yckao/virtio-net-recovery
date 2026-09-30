@@ -11,7 +11,7 @@ The agent runs in a container on the QEMU Host. It supports multiple QEMU PIDs, 
 - For domain regex selection, mount the libvirt runtime XML directory (normally `/run/libvirt/qemu`). This is read-only discovery and requires no libvirt socket access.
 - For fault injection, matching Host kernel headers under `/lib/modules` and `/usr/src`, loadable kernel modules, and a matching compiler. The fault image includes GCC 12; supported Host kernels include Ubuntu `6.8.0-52-generic` and `6.17.0-20-generic`. Other kernels require validation of their vhost internals. Kernel lockdown or module-signing policy may prevent injection.
 
-The current repository and GHCR packages are private. Log in using a GitHub token with `read:packages` access as the password when prompted:
+Public repository publication requires existing public GHCR packages; CI never changes package visibility. Private installations require authentication. Log in using a GitHub token with `read:packages` access as the password when prompted:
 
 ```sh
 sudo podman login ghcr.io -u YOUR_GITHUB_USER
@@ -55,6 +55,34 @@ Polling and extra kicks have overhead. The 20 ms configuration is an experiment 
 sudo podman logs -f vhost-watch
 sudo podman stop --time 10 vhost-watch
 ```
+
+## Opt-in recurring recovery
+
+`--mode recover` is an experimental policy for repeated lost notifications. Build the current source on the QEMU Host; the example uses the resulting local image:
+
+```sh
+sudo podman build --target agent -f deploy/Containerfile -t localhost/vhost-watch:dev .
+sudo mkdir -p /var/lib/vhost-watch
+sudo podman run --detach --rm --name vhost-watch-recover --privileged --pid=host --network=none --read-only --security-opt label=disable -v /sys/kernel/btf:/sys/kernel/btf:ro -v /var/lib/vhost-watch:/state:rw --log-driver=k8s-file --log-opt=max-size=10mb -v /run/libvirt/qemu:/run/libvirt/qemu:ro localhost/vhost-watch:dev --domain-regex '^worker-' --mode recover
+```
+
+Choose the intended domains or replace the regex with `--pid 1234`. Stop the existing observer for those PIDs before starting this one; all observers should share the same state directory. The default mode remains `observe`.
+
+Recover mode automatically batches user-ring reads and uses `--interval` for both no-progress observation and retry pacing, defaulting to 0.1 seconds. A candidate needs at least two observations with outstanding descriptors and no completion progress, followed by live confirmation of unconsumed descriptors. Every kick refreshes QEMU FD inventory and validates process identity, the pinned vhost attachment, its waiter/backend, and the nonblocking eventfd. There is no incident expiry or hourly quota: retries continue while a candidate persists, including incidents lasting 30 seconds or longer. Attempts and failures are paced from the end of validation; actual retry gaps can exceed 100 ms. Legacy `--threshold`, `--cooldown`, `--max-recoveries`, and `--kick-interval` do not control this mode. It rejects `--trace-stages` and `--once`/`--rescue`.
+
+Healthy queue discovery defaults to `--inventory-interval 5` seconds; existing queues still receive batched reads each polling interval. Set `--inventory-interval 1` explicitly to evaluate more frequent attachment discovery. New or reconfigured attachments can wait for discovery. Unsupported slots retry at the discovery interval; a previously supported attachment gets one prompt rediscovery retry before persistent failures use that interval. Healthy JSON summaries use `source: cached_user_indices`; they do not report cached consumption as fresh kernel state. Unavailable known queues retain their pending verification age and report lost observation coverage. A successful write remains unconfirmed until a later live snapshot shows both consumption and completion progress. `--verify-timeout` only schedules an unconfirmed report; it does not stop retries. Summaries aggregate attempts, writes, refusals, confirmations, and actual polling/attempt gaps. Reporting uses a one-second quiet period without blocking another recovery attempt.
+
+Operate it with the container name, logs, and the same start command:
+
+```sh
+sudo podman logs -f vhost-watch-recover
+sudo podman stop --time 10 vhost-watch-recover
+sudo podman run --rm --name vhost-recovery --privileged --pid=host --network=none --read-only --security-opt label=disable -v /sys/kernel/btf:/sys/kernel/btf:ro -v /var/lib/vhost-watch:/state:rw localhost/vhost-watch:dev --pid 1234 --once
+```
+
+Stopping detaches the agent's probes and releases its observer lock. Because the container uses `--rm`, restart by repeating the detached start command above; domain selection can follow a restarted QEMU process. Manual `--once` uses the existing verified recovery path and runs without `--mode recover`. Use a fresh `--list-queues` result with `--vhost-fd` when restricting manual recovery to one slot.
+
+Sub-500 ms application recovery, a below-one-percent throughput regression, physical dual-25 Gbps ECMP behavior, and uninterrupted BFD/BGP sessions remain qualification targets. Per-queue pacing is implemented; a Host-wide attempt cap and large simultaneous-fault scale have not been qualified. Continuous suppression of every wakeup, including recovery kicks, cannot be bypassed by this mechanism. Queue progress alone does not prove packet delivery or session continuity. Measure healthy traffic and application/session behavior separately before choosing an operating cadence.
 
 ## Manual recovery: run once
 
@@ -117,4 +145,4 @@ sudo podman build --target fault -f deploy/Containerfile -t localhost/vhost-faul
 
 `make build` requires Go 1.25 or later, Clang, libbpf headers, and a Linux x86-64 build environment. To use local images, replace the GHCR image reference in a command with the corresponding `localhost/...:dev` tag. Choose a different `--name` when running concurrent inspections or one-shot calls.
 
-GitHub Actions run Go race tests and vet, compile BPF and the Host module, and build both Linux amd64 images. Pushes to `main`, version tags, and manual runs publish to GHCR using `GITHUB_TOKEN`, then pull each digest and verify its revision, CLI, and package visibility. Tags include `main`, full `sha-<commit>`, and version tags for `v*` releases. Private repository publication requires private package visibility; publication does not make either package public.
+GitHub Actions run Go race tests and vet, compile BPF and the Host module, and build both Linux amd64 images. Pushes to `main`, version tags, and manual runs on `main` publish to GHCR using `GITHUB_TOKEN` after validating the local image and current package visibility, then pull each digest and verify its revision, CLI, and current visibility again. Tags include `main`, full `sha-<commit>`, and version tags for `v*` releases. Public repositories require existing public packages; private repositories require private packages. A missing public package stops before publication because [GHCR defaults first publication to private](https://docs.github.com/en/packages/working-with-a-github-packages-registry/working-with-the-container-registry#pushing-container-images). Initial public publication and any visibility change require separate owner approval; this workflow does not bootstrap public packages or change sharing.

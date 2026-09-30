@@ -16,7 +16,11 @@ concurrency:
 
 jobs:
   test:
-    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-14]
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
@@ -27,12 +31,17 @@ jobs:
           go-version-file: go.mod
           check-latest: true
           cache: true
-      - name: Test and vet Go
+      - name: Test native packages, vet, and build Linux commands
         run: |
           test -z "$(gofmt -l cmd internal)"
-          go test -race ./...
+          python3 .github/tests/test_image_publication.py
+          python3 .github/tests/test_package_visibility.py
+          go test -race -count=1 ./...
           go vet ./...
+          GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -trimpath ./cmd/...
       - name: Compile BPF and Host module
+        if: runner.os == 'Linux'
+        # Compilation only: hosted CI never loads kernel hooks/modules or runs live recovery.
         run: |
           sudo apt-get update
           sudo apt-get install -y clang libbpf-dev libelf-dev gcc-12 linux-headers-generic shellcheck
@@ -40,9 +49,46 @@ jobs:
           kernel_build=$(find /usr/src -maxdepth 1 -type d -name 'linux-headers-*-generic' | sort -V | tail -1)
           test -n "$kernel_build"
           make -C fault-injection/host KDIR="$kernel_build" CC=gcc-12
-          shellcheck deploy/run.sh deploy/fault.sh
+          shellcheck deploy/run.sh deploy/fault.sh .github/scripts/validate-image.sh
 
   images:
+    if: github.event_name == 'pull_request'
+    needs: test
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: agent
+          - target: fault
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+      - uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        with:
+          context: .
+          file: deploy/Containerfile
+          target: ${{ matrix.target }}
+          platforms: linux/amd64
+          push: false
+          load: true
+          tags: vhost-ci:${{ matrix.target }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+          cache-from: type=gha,scope=${{ matrix.target }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.target }}
+      - name: Verify PR image revision and unprivileged help
+        env:
+          IMAGE: vhost-ci:${{ matrix.target }}
+          EXPECTED_REVISION: ${{ github.sha }}
+        run: bash .github/scripts/validate-image.sh
+
+  publish:
+    if: github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main')
     needs: test
     runs-on: ubuntu-24.04
     timeout-minutes: 25
@@ -68,8 +114,49 @@ jobs:
           REPOSITORY: ${{ github.repository }}
           SUFFIX: ${{ matrix.suffix }}
         run: echo "name=ghcr.io/${REPOSITORY,,}${SUFFIX}" >> "$GITHUB_OUTPUT"
+      - name: Check current repository and package privacy before publishing
+        id: privacy
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPOSITORY: ${{ github.repository }}
+          OWNER: ${{ github.repository_owner }}
+          SUFFIX: ${{ matrix.suffix }}
+        run: |
+          repository_info=$(gh api "repos/$REPOSITORY" --jq '[.private, .owner.type] | @tsv')
+          IFS=$'\t' read -r private owner_type <<< "$repository_info"
+          case "$private" in
+            true) expected_visibility=private ;;
+            false) expected_visibility=public ;;
+            *) exit 1 ;;
+          esac
+          case "$owner_type" in
+            User) namespace=users ;;
+            Organization) namespace=orgs ;;
+            *) echo "Unsupported package owner type: $owner_type" >&2; exit 1 ;;
+          esac
+          package=$(printf '%s' "${REPOSITORY#*/}$SUFFIX" | tr '[:upper:]' '[:lower:]')
+          endpoint="$namespace/$OWNER/packages/container/$package"
+          echo "endpoint=$endpoint" >> "$GITHUB_OUTPUT"
+          response=$(mktemp)
+          trap 'rm -f "$response"' EXIT
+          if gh api --include "$endpoint" --jq .visibility > "$response"; then
+            visibility=$(tail -n 1 "$response")
+            case "$visibility" in public|private|internal) ;; *) exit 1 ;; esac
+            echo "Current repository private=$private; package visibility=$visibility"
+            if [ "$visibility" != "$expected_visibility" ]; then
+              echo "Refusing publication: $endpoint must be $expected_visibility. CI does not change package visibility." >&2
+              exit 1
+            fi
+          else
+            status=$(awk '/^HTTP\/[0-9.]+ / {print $2; exit}' "$response")
+            if [ "$status" != 404 ]; then cat "$response" >&2; exit 1; fi
+            if [ "$private" = false ]; then
+              echo "Refusing publication: public repository requires an existing public package at $endpoint. First GHCR publication defaults to private; bootstrap requires separate owner approval." >&2
+              exit 1
+            fi
+            echo "Package does not exist yet; verify visibility after first publication."
+          fi
       - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
-        if: github.event_name != 'pull_request'
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -80,7 +167,6 @@ jobs:
           images: ${{ steps.image.outputs.name }}
           tags: |
             type=ref,event=branch
-            type=ref,event=pr
             type=semver,pattern={{version}}
             type=sha,format=long
           labels: |
@@ -93,28 +179,41 @@ jobs:
           file: deploy/Containerfile
           target: ${{ matrix.target }}
           platforms: linux/amd64
-          push: ${{ github.event_name != 'pull_request' }}
-          load: ${{ github.event_name == 'pull_request' }}
+          push: false
+          load: true
           tags: ${{ steps.metadata.outputs.tags }}
           labels: ${{ steps.metadata.outputs.labels }}
           cache-from: type=gha,scope=${{ matrix.target }}
           cache-to: type=gha,mode=max,scope=${{ matrix.target }}
-      - name: Verify published digest, metadata, help, and private access
-        if: github.event_name != 'pull_request'
+      - name: Validate immutable local image before publishing it
+        id: publish
+        env:
+          IMAGE: ${{ steps.build.outputs.imageid }}
+          EXPECTED_REVISION: ${{ github.sha }}
+          IMAGE_NAME: ${{ steps.image.outputs.name }}
+          PUBLISH_TAGS: ${{ steps.metadata.outputs.tags }}
+        run: bash .github/scripts/validate-image.sh
+      - name: Verify published digest, revision, unprivileged help, and current privacy
         env:
           IMAGE: ${{ steps.image.outputs.name }}
-          DIGEST: ${{ steps.build.outputs.digest }}
+          DIGEST: ${{ steps.publish.outputs.digest }}
           EXPECTED_REVISION: ${{ github.sha }}
-          OWNER: ${{ github.repository_owner }}
-          PACKAGE: ${{ github.event.repository.name }}${{ matrix.suffix }}
+          REPOSITORY: ${{ github.repository }}
+          PACKAGE_ENDPOINT: ${{ steps.privacy.outputs.endpoint }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          PRIVATE_REPOSITORY: ${{ github.event.repository.private }}
         run: |
           docker pull "$IMAGE@$DIGEST"
+          test "$(docker image inspect "$IMAGE@$DIGEST" --format '{{.Id}}')" = "${{ steps.publish.outputs.image_id }}"
           revision=$(docker image inspect "$IMAGE@$DIGEST" --format '{{ index .Config.Labels "org.opencontainers.image.revision" }}')
           test "$revision" = "$EXPECTED_REVISION"
-          docker run --rm --network none "$IMAGE@$DIGEST" --help
-          visibility=$(gh api "users/$OWNER/packages/container/$PACKAGE" --jq .visibility)
-          echo "Package visibility: $visibility"
-          if [ "$PRIVATE_REPOSITORY" = true ]; then test "$visibility" = private; fi
+          docker run --rm --network none --read-only --cap-drop ALL --security-opt no-new-privileges "$IMAGE@$DIGEST" --help
+          private=$(gh api "repos/$REPOSITORY" --jq .private)
+          visibility=$(gh api "$PACKAGE_ENDPOINT" --jq .visibility)
+          case "$visibility" in public|private|internal) ;; *) exit 1 ;; esac
+          echo "Current repository private=$private; package visibility=$visibility"
+          case "$private" in
+            true) test "$visibility" = private ;;
+            false) test "$visibility" = public ;;
+            *) exit 1 ;;
+          esac
           echo "$IMAGE@$DIGEST" >> "$GITHUB_STEP_SUMMARY"
