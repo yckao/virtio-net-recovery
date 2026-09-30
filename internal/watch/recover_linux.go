@@ -41,6 +41,7 @@ func runRecover(ctx context.Context, c Config, target *Target, bpf *BPF, l *logg
 	lastLoop, maxLoopGap := started, float64(0)
 	queues := []*recoveryQueue{}
 	known := map[int]*recoveryQueue{}
+	var pendingCleanup map[int]Snapshot
 	policies := map[int]*RecoveryPolicy{}
 	var batch *RingBatch
 	var attempts, refusals, pollErrors uint64
@@ -79,9 +80,11 @@ func runRecover(ctx context.Context, c Config, target *Target, bpf *BPF, l *logg
 			"queues": rows, "unavailable_queues": len(unavailable), "source": "cached_user_indices"}
 	}
 	defer func() {
-		for _, q := range known {
-			bpf.Forget(q.snapshot)
+		current := make(map[int]Snapshot, len(known))
+		for fd, q := range known {
+			current[fd] = q.snapshot
 		}
+		forgetSnapshotSets(current, pendingCleanup, bpf.Forget)
 		l.emit("stopped", summary(monotonic()))
 		if result == nil {
 			result = l.err
@@ -124,8 +127,10 @@ func runRecover(ctx context.Context, c Config, target *Target, bpf *BPF, l *logg
 			} else {
 				lastInventoryError = ""
 				old := map[int]*recoveryQueue{}
+				pendingCleanup = make(map[int]Snapshot, len(known))
 				for fd, q := range known {
 					old[fd] = q
+					pendingCleanup[fd] = q.snapshot
 				}
 				queues = nil
 				known = map[int]*recoveryQueue{}
@@ -147,6 +152,7 @@ func runRecover(ctx context.Context, c Config, target *Target, bpf *BPF, l *logg
 					delete(discoveryFailures, remoteFD)
 					q := old[remoteFD]
 					delete(old, remoteFD)
+					delete(pendingCleanup, remoteFD)
 					p := policies[remoteFD]
 					if p == nil {
 						p = NewRecoveryPolicy(c.Interval)
@@ -181,6 +187,8 @@ func runRecover(ctx context.Context, c Config, target *Target, bpf *BPF, l *logg
 					q.policy.verification = nil
 					q.policy.Invalidate(now)
 				}
+				// All old queues are either transferred into known or forgotten.
+				pendingCleanup = nil
 				pruneRecoveryPolicies(policies, vhosts)
 				for fd := range discoveryFailures {
 					if !slices.Contains(vhosts, fd) {

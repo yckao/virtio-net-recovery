@@ -9,3 +9,16 @@ func pruneRetiredTargets(retired, wanted map[string]bool) {
 		}
 	}
 }
+
+// An interrupted inventory refresh still owns snapshots not yet transferred
+// into its current set. Release both attachment generations, once per slot.
+func forgetSnapshotSets(current, pending map[int]Snapshot, forget func(Snapshot)) {
+	for fd, s := range pending {
+		if live, ok := current[fd]; !ok || live.Identity() != s.Identity() {
+			forget(s)
+		}
+	}
+	for _, s := range current {
+		forget(s)
+	}
+}
