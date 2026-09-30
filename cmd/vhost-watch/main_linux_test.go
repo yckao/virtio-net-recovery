@@ -136,3 +136,22 @@ func TestParseConfigOnceDurationDoesNotSelectTrace(t *testing.T) {
 		t.Fatalf("duration changed the manual-write policy: %+v", cfg.Agent)
 	}
 }
+
+func TestParseConfigMetricsIsOptIn(t *testing.T) {
+	for _, test := range []struct {
+		args    []string
+		address string
+	}{
+		{nil, ""},
+		{[]string{"--metrics-address", ""}, ""},
+		{[]string{"--metrics-address", "127.0.0.1:9475"}, "127.0.0.1:9475"},
+	} {
+		cfg, err := parseConfig(append([]string{"--pid", "1234"}, test.args...))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if cfg.MetricsAddress != test.address || cfg.Agent.Metrics != nil {
+			t.Fatalf("unexpected metrics configuration: address %q, collector %v", cfg.MetricsAddress, cfg.Agent.Metrics)
+		}
+	}
+}

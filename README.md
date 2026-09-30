@@ -86,6 +86,16 @@ An episode has a **30-second diagnostic deadline**, enforced at the next complet
 
 Snapshots identify cached user indices versus a live snapshot. Host descriptor consumption and queued-work values are meaningful only when their freshness flags are set; consumption does not prove backend transmission or receiver delivery. `after_write` means only that the latest sample was taken after the first accepted write; progress can predate that write and does not prove causation or a lost notification. The **30-second episode timeout** bounds diagnostics; the separate `--verify-timeout` bounds the wait before reporting `recovery_unconfirmed`. Recovery verification retains the first write's baseline and originating `event_id` across episode closure or reopening. `progress_after_kick` and `recovery_unconfirmed` refer to that origin, and summaries retain the pending verification ID and timeout state. Neither timeout stops recovery retries.
 
+### Metrics
+
+Metrics are disabled by default. To expose `/metrics` on the Host's loopback interface, explicitly use Host networking and provide `--metrics-address`:
+
+```sh
+sudo podman run --detach --rm --name vhost-watch-metrics --privileged --pid=host --network=host --read-only --security-opt label=disable -v /sys/kernel/btf:/sys/kernel/btf:ro -v /var/lib/vhost-watch:/state:rw --log-driver=journald localhost/vhost-watch:dev --pid 1234,5678 --mode observe --metrics-address 127.0.0.1:9475
+```
+
+The exporter binds before target discovery or BPF setup; a bind failure aborts startup. All selected VMs share totals, while current queue coverage, open episodes and polling gaps aggregate only active workers. Labels use fixed reason, write result and progress outcome values; identity, PID, event ID and raw indices are excluded. A successful write and later queue progress remain separate observations.
+
 ### Manual kick
 
 Write one verified kick to every selected TX slot and exit:

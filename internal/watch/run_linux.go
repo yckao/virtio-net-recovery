@@ -23,6 +23,7 @@ type Config struct {
 	VhostFD                                                               int
 	Domain                                                                string
 	CheckIdentity                                                         func() error
+	Metrics                                                               *Metrics
 }
 
 func (c Config) Validate() error {
