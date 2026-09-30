@@ -276,6 +276,33 @@ func TestRecoveryJournalOutputFailureDoesNotReclassifyAcceptedWrite(t *testing.T
 	}
 }
 
+func TestInterruptedRefreshStoppedSummaryRetainsClosedEpisodeVerification(t *testing.T) {
+	q, target, clock, l, _, _ := recoveryJournalFixture(t)
+	if err := recoverLive(context.Background(), Config{Mode: "recover"}, target, testBPF{value: q.snapshot}, l, q, true); err != nil {
+		t.Fatal(err)
+	}
+	origin := q.verificationEventID
+	q.closeEpisode(EpisodeOutcomeUnavailable)
+	*clock = 8
+	q.policy.Unconfirmed(*clock, 5)
+	known := map[int]*recoveryQueue{}
+	restoreUnvisitedRecoveryQueues(known, map[int]*recoveryQueue{q.fd: q})
+	known[q.fd].closeEpisode(EpisodeOutcomeStopped)
+	row := known[q.fd].summary(*clock)
+	if row["verification_event_id"] != origin || row["verification_pending"] != true || row["verification_timed_out"] != true || row["unconfirmed_age"] != float64(8) {
+		t.Fatalf("stopped summary lost an unvisited queue's original verification: %+v", row)
+	}
+	if row["episode_open"] != false {
+		t.Fatal("stopped summary reopened the closed diagnostic episode")
+	}
+	current := &recoveryQueue{fd: q.fd, policy: NewRecoveryPolicy(.1)}
+	known[q.fd] = current
+	restoreUnvisitedRecoveryQueues(known, map[int]*recoveryQueue{q.fd: q})
+	if known[q.fd] != current {
+		t.Fatal("stopped summary replaced a current attachment with pending history")
+	}
+}
+
 func TestRecoveryJournalIdentityChangeClosesAndClearsVerification(t *testing.T) {
 	q, target, clock, l, output, _ := recoveryJournalFixture(t)
 	if err := recoverLive(context.Background(), Config{Mode: "recover"}, target, testBPF{value: q.snapshot}, l, q, true); err != nil {

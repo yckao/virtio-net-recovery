@@ -95,6 +95,16 @@ func (q *recoveryQueue) summary(now float64) map[string]any {
 		"unconfirmed_age":        q.policy.PendingAge(now), "indices_sample_at": q.sampledAt}
 }
 
+// The stopped summary must include queues not yet visited by an interrupted
+// inventory refresh, including verification whose diagnostic episode closed.
+func restoreUnvisitedRecoveryQueues(known, pending map[int]*recoveryQueue) {
+	for fd, q := range pending {
+		if known[fd] == nil {
+			known[fd] = q
+		}
+	}
+}
+
 // runRecover has one common cadence, one batched user-ring read per healthy
 // tick in observe and recover, with no traffic-path probes. Cached user
 // addresses only identify a candidate; every write requires fresh process, FD and attachment validation.
@@ -143,6 +153,7 @@ func runRecover(ctx context.Context, c Config, target *Target, bpf *BPF, l *logg
 			"queues": rows, "unavailable_queues": len(unavailable), "source": "cached_user_indices"}
 	}
 	defer func() {
+		restoreUnvisitedRecoveryQueues(known, pendingCleanup)
 		current := make(map[int]Snapshot, len(known))
 		pending := make(map[int]Snapshot, len(pendingCleanup))
 		for fd, q := range pendingCleanup {
