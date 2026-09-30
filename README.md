@@ -96,6 +96,12 @@ sudo podman run --detach --rm --name vhost-watch-metrics --privileged --pid=host
 
 The exporter binds before target discovery or BPF setup; a bind failure aborts startup. All selected VMs share totals, while current queue coverage, open episodes and polling gaps aggregate only active workers. Labels use fixed reason, write result and progress outcome values; identity, PID, event ID and raw indices are excluded. A successful write and later queue progress remain separate observations.
 
+`candidates_total` counts diagnostic episode openings. `decisions_total` records one final fixed live/pre-write verdict per live confirmation call; syscall write failures and cancellation retain the last live verdict, while unavailable or changed attachments report their respective reason. `writes_total` counts every accepted kick, attempted syscall failure, or safety/cancellation refusal independently of journal rate limits. A stdout failure is not a kick failure or refusal. Manual kick contributes write results only; trace contributes polling health and queue coverage without creating candidates or writing kicks.
+
+`progress_total` counts **only closed diagnostic episodes** with `consumption`, `used`, `both`, `timeout`, or `identity_change` outcomes, at most once per episode. Quiet, unavailable, invalid-ring and stopped closures have no progress counter. Verification timeout warnings and later `progress_after_kick` reports use their own first-write baseline and do not increment this counter again. Episode progress can predate a write and does not establish causation.
+
+`poll_errors_total` counts cycles with at least one polling/observation error, including partial coverage failures, but not stdout failures, kick syscall failures or normal cancellation. Queue gauges describe the latest completed cycle. `poll_gap_seconds` reports the largest completed cycle gap or age since the last completed poll; `poll_max_gap_seconds` also includes current age. Never-polled workers do not contribute an age, and retired workers immediately stop contributing gauges.
+
 ### Manual kick
 
 Write one verified kick to every selected TX slot and exit:

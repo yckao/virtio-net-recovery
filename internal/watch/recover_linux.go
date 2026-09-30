@@ -22,11 +22,13 @@ type recoveryQueue struct {
 	journal                          *EpisodeJournal
 	lastDecision                     EpisodeReason
 	lastEventID, verificationEventID string
+	metrics                          *Metrics
 }
 
 func (q *recoveryQueue) ensureJournal(l *logger) {
 	if q.journal == nil {
 		q.journal = NewEpisodeJournal(func(event string, fields map[string]any) {
+			q.metrics.episodeEvent(event, fields)
 			fields["vhost_fd"], fields["eventfd_id"], fields["num"] = q.fd, q.snapshot.EventID, q.snapshot.Num
 			if event == "candidate" {
 				q.lastEventID = fields["event_id"].(string)
@@ -34,6 +36,13 @@ func (q *recoveryQueue) ensureJournal(l *logger) {
 			l.emit(event, fields)
 		}, monotonic)
 	}
+}
+
+func (q *recoveryQueue) recordWrite(result EpisodeWrite, reason EpisodeReason) {
+	if q.metrics != nil {
+		q.metrics.Write(WriteResult(result))
+	}
+	q.journal.RecordWrite(result, reason)
 }
 
 func (q *recoveryQueue) decision(reason EpisodeReason) {
@@ -119,9 +128,20 @@ func runRecover(ctx context.Context, c Config, target *Target, bpf *BPF, l *logg
 	var batch *RingBatch
 	var attempts, writeErrors, refusals, pollErrors uint64
 	var progress recoveryProgressTotals
+	discoveryFailures := map[int]string{}
+	var metricsPending bool
+	var metricsErrors uint64
+	var metricsGap float64
+	var metricsSampled int
+	finishMetrics := func() {
+		if metricsPending {
+			recordRecoveryMetrics(c.metricWorker, known, discoveryFailures, metricsSampled, metricsGap, pollErrors > metricsErrors)
+			metricsPending = false
+		}
+	}
+	defer finishMetrics()
 	forceInventory := true
 	lastInventoryError := ""
-	discoveryFailures := map[int]string{}
 	summary := func(now float64) map[string]any {
 		rows := make([]map[string]any, 0, len(known))
 		knownFDs, sampledFDs := make([]int, 0, len(known)), []int{}
@@ -176,8 +196,10 @@ func runRecover(ctx context.Context, c Config, target *Target, bpf *BPF, l *logg
 		if ctx.Err() != nil {
 			return l.err
 		}
+		metricsPending, metricsErrors, metricsSampled = true, pollErrors, 0
 		alive, err := target.CheckAlive()
 		if err != nil {
+			pollErrors++
 			return err
 		}
 		if !alive {
@@ -185,6 +207,7 @@ func runRecover(ctx context.Context, c Config, target *Target, bpf *BPF, l *logg
 			return l.err
 		}
 		now := monotonic()
+		metricsGap = now - lastLoop
 		maxLoopGap = max(maxLoopGap, now-lastLoop)
 		lastLoop = now
 		if c.Duration > 0 && now-started >= c.Duration {
@@ -252,7 +275,7 @@ func runRecover(ctx context.Context, c Config, target *Target, bpf *BPF, l *logg
 						q = nil
 					}
 					if q == nil {
-						q = &recoveryQueue{fd: remoteFD, policy: p, lastLive: math.Inf(-1)}
+						q = &recoveryQueue{fd: remoteFD, policy: p, lastLive: math.Inf(-1), metrics: c.Metrics}
 					}
 					q.snapshot, q.avail, q.used, q.sampledAt = s, row.Avail, row.Used, monotonic()
 					q.ensureJournal(l)
@@ -289,6 +312,7 @@ func runRecover(ctx context.Context, c Config, target *Target, bpf *BPF, l *logg
 				if len(snapshots) != 0 {
 					batch, err = NewRingBatch(target, snapshots)
 					if err != nil {
+						pollErrors++
 						return err
 					}
 				}
@@ -306,6 +330,7 @@ func runRecover(ctx context.Context, c Config, target *Target, bpf *BPF, l *logg
 				}
 				forceInventory = true
 			} else {
+				metricsSampled = len(queues)
 				sampledAt := monotonic()
 				maxPollGap = max(maxPollGap, sampledAt-lastPoll)
 				lastPoll = sampledAt
@@ -375,6 +400,7 @@ func runRecover(ctx context.Context, c Config, target *Target, bpf *BPF, l *logg
 			l.emit("sample", summary(now))
 			lastSummary = now
 		}
+		finishMetrics()
 		if l.err != nil {
 			return l.err
 		}
@@ -384,6 +410,25 @@ func runRecover(ctx context.Context, c Config, target *Target, bpf *BPF, l *logg
 		case <-ticker.C:
 		}
 	}
+}
+
+func recordRecoveryMetrics(w *WorkerMetrics, known map[int]*recoveryQueue, failures map[int]string, sampled int, gap float64, failed bool) {
+	if w == nil {
+		return
+	}
+	open, unavailable := 0, len(known)-sampled
+	for _, q := range known {
+		if q.journal != nil && q.journal.Active() {
+			open++
+		}
+	}
+	for fd := range failures {
+		if known[fd] == nil {
+			unavailable++
+		}
+	}
+	w.SetGauges(open, sampled, max(0, unavailable))
+	w.ObservePoll(time.Duration(gap*float64(time.Second)), failed)
 }
 
 func liveEpisodeSample(row QueueRow, at float64) EpisodeSample {
@@ -410,6 +455,14 @@ func liveRecoveryDecision(s Snapshot, row QueueRow, cachedUsed uint16) EpisodeRe
 }
 
 func recoverLive(ctx context.Context, c Config, target liveQueueTarget, bpf snapshotter, l *logger, q *recoveryQueue, candidate bool) (result error) {
+	q.metrics = c.Metrics
+	metricDecision := ReasonUnavailable
+	outputFailed := false
+	defer func() {
+		if c.Metrics != nil {
+			c.Metrics.Decision(metricDecision)
+		}
+	}()
 	writesBefore := q.policy.Writes
 	if q.journal == nil {
 		q.observeCached(l, q.clock(), candidate)
@@ -418,7 +471,7 @@ func recoverLive(ctx context.Context, c Config, target liveQueueTarget, bpf snap
 	}
 	q.lastDecision = EpisodeReasonUnavailable
 	defer func() {
-		if result == nil || q.policy.Writes > writesBefore {
+		if result == nil || q.policy.Writes > writesBefore || outputFailed {
 			return
 		}
 		var writeErr *KickWriteError
@@ -428,12 +481,13 @@ func recoverLive(ctx context.Context, c Config, target liveQueueTarget, bpf snap
 			writeResult = EpisodeWriteError
 		} else if errors.Is(result, ErrKickIdentityChanged) {
 			q.lastDecision = EpisodeReasonIdentityChange
+			metricDecision = ReasonIdentityChange
 		} else if errors.Is(result, context.Canceled) || errors.Is(result, context.DeadlineExceeded) {
 			q.lastDecision = EpisodeReasonCancelled
 		}
 		q.decision(q.lastDecision)
 		if candidate && c.Mode == "recover" {
-			q.journal.RecordWrite(writeResult, q.lastDecision)
+			q.recordWrite(writeResult, q.lastDecision)
 		}
 		switch q.lastDecision {
 		case EpisodeReasonIdentityChange:
@@ -448,11 +502,13 @@ func recoverLive(ctx context.Context, c Config, target liveQueueTarget, bpf snap
 		return err
 	}
 	if s.Identity() != q.snapshot.Identity() {
+		metricDecision = ReasonIdentityChange
 		q.decision(EpisodeReasonIdentityChange)
 		return errors.New("queue identity changed during cached ring polling")
 	}
 	now := q.clock()
 	decision := liveRecoveryDecision(s, row, q.used)
+	metricDecision = DecisionReason(decision)
 	q.decision(decision)
 	sample := liveEpisodeSample(row, now)
 	sample.Invalid = decision == EpisodeReasonInvalidRing
@@ -460,7 +516,7 @@ func recoverLive(ctx context.Context, c Config, target liveQueueTarget, bpf snap
 	if decision == EpisodeReasonInvalidRing {
 		if candidate && c.Mode == "recover" {
 			q.policy.Refused(true)
-			q.journal.RecordWrite(EpisodeWriteRefused, decision)
+			q.recordWrite(EpisodeWriteRefused, decision)
 		}
 		q.closeEpisode(EpisodeOutcomeInvalidRing)
 		q.policy.Invalidate(now)
@@ -475,17 +531,19 @@ func recoverLive(ctx context.Context, c Config, target liveQueueTarget, bpf snap
 		q.verificationEventID = ""
 	}
 	if !candidate {
+		outputFailed = l.err != nil
 		return l.err
 	}
 	if decision != EpisodeReasonUnconsumed {
 		if c.Mode == "recover" {
 			q.policy.Refused(true)
-			q.journal.RecordWrite(EpisodeWriteRefused, decision)
+			q.recordWrite(EpisodeWriteRefused, decision)
 		}
 		q.policy.Invalidate(now)
 		return nil
 	}
 	if l.err != nil || c.Mode != "recover" {
+		outputFailed = l.err != nil
 		return l.err
 	}
 	if err := ctx.Err(); err != nil {
@@ -493,21 +551,25 @@ func recoverLive(ctx context.Context, c Config, target liveQueueTarget, bpf snap
 	}
 	if c.CheckIdentity != nil {
 		if err := c.CheckIdentity(); err != nil {
+			metricDecision = ReasonIdentityChange
 			q.decision(EpisodeReasonIdentityChange)
 			return err
 		}
 	}
 	vhosts, events, err := target.Inventory()
 	if err != nil {
+		metricDecision = ReasonUnavailable
 		q.decision(EpisodeReasonUnavailable)
 		return err
 	}
 	if !slices.Contains(vhosts, q.fd) {
+		metricDecision = ReasonIdentityChange
 		q.decision(EpisodeReasonIdentityChange)
 		return errors.New("vhost FD disappeared before recovery")
 	}
 	fd, err := target.Duplicate(q.fd)
 	if err != nil {
+		metricDecision = ReasonUnavailable
 		q.decision(EpisodeReasonUnavailable)
 		return err
 	}
@@ -517,9 +579,14 @@ func recoverLive(ctx context.Context, c Config, target liveQueueTarget, bpf snap
 		q.journal.RecordDecision(q.lastDecision)
 	}
 	if l.err != nil {
+		outputFailed = true
 		return l.err
 	}
 	if err := RekickContext(ctx, target, bpf, fd, s, events); err != nil {
+		var writeErr *KickWriteError
+		if !errors.As(err, &writeErr) && !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
+			metricDecision = ReasonUnavailable
+		}
 		q.lastDecision = EpisodeReasonUnavailable
 		return err
 	}
@@ -527,6 +594,6 @@ func recoverLive(ctx context.Context, c Config, target liveQueueTarget, bpf snap
 		q.verificationEventID = q.journal.EventID()
 	}
 	q.policy.Written(q.clock(), row.Used, row.Consumed)
-	q.journal.RecordWrite(EpisodeWriteSuccess, EpisodeReasonUnconsumed)
+	q.recordWrite(EpisodeWriteSuccess, EpisodeReasonUnconsumed)
 	return l.err
 }

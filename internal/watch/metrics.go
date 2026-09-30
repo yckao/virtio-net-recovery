@@ -49,6 +49,7 @@ type metricCounters struct {
 type workerGauges struct {
 	open, sampled, unavailable int
 	lastGap, maxGap            time.Duration
+	lastPollAt                 time.Time
 }
 
 // Metrics exports fixed series only. Its zero value is ready for use.
@@ -107,7 +108,11 @@ func (w *WorkerMetrics) ObservePoll(gap time.Duration, failed bool) {
 	if !ok || gap < 0 {
 		return
 	}
-	g.lastGap, g.maxGap = gap, max(g.maxGap, gap)
+	now := time.Now()
+	if !g.lastPollAt.IsZero() {
+		g.maxGap = max(g.maxGap, now.Sub(g.lastPollAt))
+	}
+	g.lastGap, g.maxGap, g.lastPollAt = gap, max(g.maxGap, gap), now
 	m.workers[w] = g
 	if failed {
 		m.counters.pollErrors++
@@ -151,6 +156,31 @@ func (m *Metrics) Progress(outcome ProgressOutcome) bool {
 	return m.increment(string(outcome), progressLabels[:], m.counters.progress[:])
 }
 
+// episodeEvent counts openings and one supported outcome per closed episode.
+// Verification warnings/confirmations have a different baseline and are not
+// counted again. Quiet, unavailable, invalid and stopped closures are omitted.
+func (m *Metrics) episodeEvent(event string, fields map[string]any) {
+	if m == nil {
+		return
+	}
+	if event == "candidate" {
+		m.Candidate()
+	} else if event == "episode_closed" {
+		switch fields["outcome"] {
+		case EpisodeOutcomeConsumed:
+			m.Progress(ProgressConsumption)
+		case EpisodeOutcomeUsed:
+			m.Progress(ProgressUsed)
+		case EpisodeOutcomeBoth:
+			m.Progress(ProgressBoth)
+		case EpisodeOutcomeTimeout:
+			m.Progress(ProgressTimeout)
+		case EpisodeOutcomeIdentityChange:
+			m.Progress(ProgressIdentityChange)
+		}
+	}
+}
+
 type metricSnapshot struct {
 	metricCounters
 	workerGauges
@@ -160,12 +190,17 @@ func (m *Metrics) snapshot() metricSnapshot {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	s := metricSnapshot{metricCounters: m.counters}
+	now := time.Now()
 	for _, g := range m.workers {
 		s.open += g.open
 		s.sampled += g.sampled
 		s.unavailable += g.unavailable
-		s.lastGap = max(s.lastGap, g.lastGap)
-		s.maxGap = max(s.maxGap, g.maxGap)
+		age := time.Duration(0)
+		if !g.lastPollAt.IsZero() {
+			age = now.Sub(g.lastPollAt)
+		}
+		s.lastGap = max(s.lastGap, g.lastGap, age)
+		s.maxGap = max(s.maxGap, g.maxGap, age)
 	}
 	return s
 }
@@ -210,8 +245,8 @@ func (m *Metrics) Handler() http.Handler {
 		metricLabels(w, "progress_total", "Episode progress outcomes; not proof of causation.", "outcome", progressLabels[:], s.progress[:])
 		metricValue(w, "open_episodes", "Currently open episodes across active workers.", "gauge", s.open)
 		metricValue(w, "poll_errors_total", "Failed polling cycles across all workers.", "counter", s.pollErrors)
-		metricValue(w, "poll_gap_seconds", "Largest last polling gap among active workers.", "gauge", s.lastGap.Seconds())
-		metricValue(w, "poll_max_gap_seconds", "Largest polling gap since an active worker registered.", "gauge", s.maxGap.Seconds())
+		metricValue(w, "poll_gap_seconds", "Largest last cycle gap or age since an active worker completed polling.", "gauge", s.lastGap.Seconds())
+		metricValue(w, "poll_max_gap_seconds", "Largest cycle gap or elapsed time between completed polls, including current age.", "gauge", s.maxGap.Seconds())
 		metricValue(w, "sampled_queues", "Queues sampled in active workers' latest cycles.", "gauge", s.sampled)
 		metricValue(w, "unavailable_queues", "Known queues unavailable in active workers' latest cycles.", "gauge", s.unavailable)
 	})

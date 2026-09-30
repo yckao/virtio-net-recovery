@@ -162,6 +162,48 @@ func TestMetricsWorkerMemoryBoundAndChurn(t *testing.T) {
 	}
 }
 
+func TestMetricsPollAgeExposesStalledWorkerWithoutTimer(t *testing.T) {
+	m := NewMetrics()
+	w := newMetricWorker(t, m)
+	requireMetric(t, scrapeMetrics(t, m), "poll_gap_seconds", 0)
+	w.ObservePoll(100*time.Millisecond, false)
+	m.mu.Lock()
+	g := m.workers[w]
+	g.lastPollAt = time.Now().Add(-2 * time.Second)
+	m.workers[w] = g
+	m.mu.Unlock()
+	values := scrapeMetrics(t, m)
+	for _, name := range []string{"poll_gap_seconds", "poll_max_gap_seconds"} {
+		if values["vhost_watch_"+name] < 2 {
+			t.Errorf("%s concealed a stalled poll: %v", name, values["vhost_watch_"+name])
+		}
+	}
+	w.ObservePoll(100*time.Millisecond, false)
+	if scrapeMetrics(t, m)["vhost_watch_poll_max_gap_seconds"] < 2 {
+		t.Fatal("resumed polling discarded the observed stall duration")
+	}
+	w.Retire()
+	requireMetric(t, scrapeMetrics(t, m), "poll_gap_seconds", 0)
+}
+
+func TestMetricsClosedEpisodeOutcomesAreCountedOnce(t *testing.T) {
+	m := NewMetrics()
+	for _, outcome := range []EpisodeOutcome{EpisodeOutcomeConsumed, EpisodeOutcomeUsed, EpisodeOutcomeBoth, EpisodeOutcomeTimeout, EpisodeOutcomeIdentityChange} {
+		j := NewEpisodeJournal(m.episodeEvent, func() float64 { return 0 })
+		j.Observe(episodeSample(0, 10), true)
+		j.Open(EpisodeReasonCandidate)
+		j.Close(outcome)
+		j.Close(outcome)
+		m.episodeEvent("recovery_unconfirmed", map[string]any{"outcome": outcome})
+		m.episodeEvent("progress_after_kick", map[string]any{"outcome": outcome})
+	}
+	values := scrapeMetrics(t, m)
+	requireMetric(t, values, "candidates_total", 5)
+	for _, label := range []string{"consumption", "used", "both", "timeout", "identity_change"} {
+		requireMetric(t, values, fmt.Sprintf("progress_total{outcome=%q}", label), 1)
+	}
+}
+
 func TestMetricsConcurrentUpdatesAndScrapes(t *testing.T) {
 	const workers, cycles = 32, 200
 	m := NewMetrics()
