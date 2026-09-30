@@ -219,7 +219,7 @@ func TestBatchedRingReadAndPartialFailure(t *testing.T) {
 }
 
 func TestConfigRejectsUnboundedOrInvalidValues(t *testing.T) {
-	c := Config{PID: 1, Mode: "observe", StateDir: "/state", BPFObject: "/watch.bpf.o", Interval: 0.25, InventoryInterval: 1, Threshold: 3, Cooldown: 30, KickInterval: 1, VerifyTimeout: 5, SummaryInterval: 1, MaxRecoveries: 3, VhostFD: -1}
+	c := Config{PID: 1, Mode: "observe", StateDir: "/state", BPFObject: "/watch.bpf.o", Interval: 0.25, InventoryInterval: 1, VerifyTimeout: 5, SummaryInterval: 1, VhostFD: -1}
 	if err := c.Validate(); err != nil {
 		t.Fatal(err)
 	}
@@ -237,18 +237,35 @@ func TestConfigRejectsUnboundedOrInvalidValues(t *testing.T) {
 	}
 }
 
-func TestRecoverConfigUsesCadenceWithoutLegacyBudgetAndRefusesHotPathTracing(t *testing.T) {
+func TestFourModesAndTraceBounds(t *testing.T) {
 	c := Config{PID: 1, Mode: "recover", StateDir: "/state", BPFObject: "/watch.bpf.o", Interval: .1, InventoryInterval: 5, VerifyTimeout: 5, SummaryInterval: 5, VhostFD: -1}
+	for _, mode := range []string{"observe", "recover", "kick", "trace"} {
+		c.Mode, c.Duration = mode, 30
+		if err := c.Validate(); err != nil {
+			t.Fatalf("%s: %v", mode, err)
+		}
+	}
+	for _, value := range []float64{0, .5, 301, math.NaN(), math.Inf(1)} {
+		c.Duration = value
+		if c.Validate() == nil {
+			t.Fatalf("trace accepted duration %v", value)
+		}
+	}
+	c.Mode, c.Duration = "recover", 0
+	c.VhostFD = 42
+	if c.Validate() == nil {
+		t.Fatal("recover allowed a manual-kick FD selector")
+	}
+	c.Mode = "kick"
 	if err := c.Validate(); err != nil {
-		t.Fatalf("recover required unused legacy thresholds or budget: %v", err)
+		t.Fatal(err)
 	}
-	c.TraceStages = true
-	if c.Validate() == nil {
-		t.Fatal("recover allowed traffic-dependent stage probes")
-	}
-	c.TraceStages, c.Rescue = false, true
-	if c.Validate() == nil {
-		t.Fatal("recover allowed observer-lock bypass through rescue")
+	c.VhostFD = -1
+	for _, mode := range []string{"guarded", "periodic", "unknown"} {
+		c.Mode = mode
+		if c.Validate() == nil {
+			t.Fatalf("accepted removed mode %s", mode)
+		}
 	}
 }
 

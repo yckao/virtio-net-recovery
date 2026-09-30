@@ -49,14 +49,22 @@ func RunSelected(ctx context.Context, cfg ManagerConfig, output io.Writer) error
 	if err := base.Validate(); err != nil {
 		return err
 	}
-	if base.Rescue && cfg.List {
-		return errors.New("--once and --list cannot be combined")
+	if (base.Mode == "kick" || base.Mode == "trace") && cfg.List {
+		return errors.New("kick/trace mode cannot be combined with --list")
 	}
 	if cfg.List && cfg.ListQueues {
 		return errors.New("choose --list or --list-queues")
 	}
-	if base.Rescue && cfg.ListQueues {
-		return errors.New("--once and --list-queues cannot be combined")
+	if (base.Mode == "kick" || base.Mode == "trace") && cfg.ListQueues {
+		return errors.New("kick/trace mode cannot be combined with --list-queues")
+	}
+	var traceOutput *traceWriter
+	if base.Mode == "trace" {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, time.Duration(base.Duration*float64(time.Second)))
+		defer cancel()
+		traceOutput = newTraceWriter(output, cancel)
+		output = traceOutput
 	}
 	writer := &lockedWriter{w: output}
 	log := &logger{encoder: json.NewEncoder(writer)}
@@ -76,13 +84,13 @@ func RunSelected(ctx context.Context, cfg ManagerConfig, output io.Writer) error
 		}
 		return log.err
 	}
-	if (base.Rescue || cfg.ListQueues) && len(targets) == 0 {
+	if (base.Mode == "kick" || base.Mode == "trace" || cfg.ListQueues) && len(targets) == 0 {
 		return errors.New("no selected running QEMU targets")
 	}
 	if base.VhostFD >= 0 && len(targets) != 1 {
 		return errors.New("--vhost-fd requires exactly one selected VM")
 	}
-	bpf, err := OpenBPF(base.BPFObject, base.TraceStages)
+	bpf, err := OpenBPF(base.BPFObject, base.Mode == "trace")
 	if err != nil {
 		return err
 	}
@@ -94,7 +102,30 @@ func RunSelected(ctx context.Context, cfg ManagerConfig, output io.Writer) error
 		c.CheckIdentity = func() error { return cfg.Selector.Check(t) }
 		return c
 	}
-	if base.Rescue || cfg.ListQueues {
+	if base.Mode == "trace" {
+		// Capture this process generation set once. Regex selection does not
+		// attach replacement/new VMs during a bounded diagnostic session.
+		done := make(chan error, len(targets))
+		for _, t := range targets {
+			c := policy(t)
+			go func() { done <- RunWithBPF(ctx, c, writer, bpf) }()
+		}
+		failures := len(problems)
+		for range targets {
+			if err := <-done; err != nil {
+				failures++
+				log.emit("target_failed", map[string]any{"error": err.Error()})
+			}
+		}
+		if err := traceOutput.Err(); err != nil {
+			return err
+		}
+		if failures > 0 {
+			return fmt.Errorf("%d selected trace target(s) failed", failures)
+		}
+		return log.err
+	}
+	if base.Mode == "kick" || cfg.ListQueues {
 		failures := len(problems)
 		for _, t := range targets {
 			if ctx.Err() != nil {
@@ -148,10 +179,11 @@ func RunSelected(ctx context.Context, cfg ManagerConfig, output io.Writer) error
 	ticker := time.NewTicker(cfg.Refresh)
 	defer ticker.Stop()
 	for {
-		wanted := map[string]selection.Target{}
+		wanted := map[string]bool{}
 		for _, t := range targets {
-			wanted[t.Key()] = t
+			wanted[t.Key()] = true
 		}
+		pruneRetiredTargets(retired, wanted)
 		for key, w := range workers {
 			if _, ok := wanted[key]; !ok {
 				w.cancel()

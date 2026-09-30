@@ -33,9 +33,9 @@ func (q *recoveryQueue) summary(now float64) map[string]any {
 }
 
 // runRecover has one common cadence, one batched user-ring read per healthy
-// tick, and no traffic-path probes. Cached user addresses only identify a
-// candidate; every write requires fresh process, FD and attachment validation.
-func runRecover(ctx context.Context, c Config, target *Target, bpf *BPF, l *logger) error {
+// tick in observe and recover, with no traffic-path probes. Cached user
+// addresses only identify a candidate; every write requires fresh process, FD and attachment validation.
+func runRecover(ctx context.Context, c Config, target *Target, bpf *BPF, l *logger) (result error) {
 	started, lastInventory, lastSummary := monotonic(), math.Inf(-1), math.Inf(-1)
 	lastPoll, maxPollGap := started, float64(0)
 	lastLoop, maxLoopGap := started, float64(0)
@@ -78,7 +78,15 @@ func runRecover(ctx context.Context, c Config, target *Target, bpf *BPF, l *logg
 			"poll_errors": pollErrors, "max_poll_gap": max(maxPollGap, now-lastPoll), "max_loop_gap": maxLoopGap,
 			"queues": rows, "unavailable_queues": len(unavailable), "source": "cached_user_indices"}
 	}
-	defer func() { l.emit("stopped", summary(monotonic())) }()
+	defer func() {
+		for _, q := range known {
+			bpf.Forget(q.snapshot)
+		}
+		l.emit("stopped", summary(monotonic()))
+		if result == nil {
+			result = l.err
+		}
+	}()
 	ticker := time.NewTicker(time.Duration(c.Interval * float64(time.Second)))
 	defer ticker.Stop()
 	for {
@@ -173,6 +181,7 @@ func runRecover(ctx context.Context, c Config, target *Target, bpf *BPF, l *logg
 					q.policy.verification = nil
 					q.policy.Invalidate(now)
 				}
+				pruneRecoveryPolicies(policies, vhosts)
 				for fd := range discoveryFailures {
 					if !slices.Contains(vhosts, fd) {
 						delete(discoveryFailures, fd)
@@ -215,14 +224,15 @@ func runRecover(ctx context.Context, c Config, target *Target, bpf *BPF, l *logg
 					}
 					verify := q.policy.NeedsVerification(q.used)
 					if (ready || verify) && now-q.lastLive >= c.Interval {
-						attempt := ready && q.policy.Attempt(now)
-						if attempt || verify {
+						inspect := ready && (c.Mode == "observe" || q.policy.Attempt(now))
+						attempt := inspect && c.Mode == "recover"
+						if inspect || verify {
 							q.lastLive = now
 							if attempt {
 								attempts++
 							}
 							beforeWrites, beforeConfirmed := q.policy.Writes, q.policy.Confirmed
-							err := recoverLive(ctx, c, target, bpf, l, q, attempt)
+							err := recoverLive(ctx, c, target, bpf, l, q, inspect)
 							q.lastLive = monotonic()
 							if attempt {
 								q.policy.FinishAttempt(q.lastLive)
@@ -237,7 +247,7 @@ func runRecover(ctx context.Context, c Config, target *Target, bpf *BPF, l *logg
 									refusals++
 								} else {
 									pollErrors++
-									event = "verification_unavailable"
+									event = "observation_unavailable"
 								}
 								q.policy.Invalidate(now)
 								forceInventory = true
@@ -259,7 +269,7 @@ func runRecover(ctx context.Context, c Config, target *Target, bpf *BPF, l *logg
 				}
 			}
 		}
-		// A loss of coverage must not suspend the original verification deadline.
+		// Coverage loss must not postpone the original verification deadline.
 		// Preserve the baseline so later live progress can still be observed.
 		for _, q := range known {
 			if q.policy.Unconfirmed(now, c.VerifyTimeout) {
@@ -281,7 +291,7 @@ func runRecover(ctx context.Context, c Config, target *Target, bpf *BPF, l *logg
 	}
 }
 
-func recoverLive(ctx context.Context, c Config, target *Target, bpf *BPF, l *logger, q *recoveryQueue, attempt bool) error {
+func recoverLive(ctx context.Context, c Config, target liveQueueTarget, bpf snapshotter, l *logger, q *recoveryQueue, candidate bool) error {
 	s, row, err := liveRow(target, bpf, q.fd)
 	if err != nil {
 		return err
@@ -293,13 +303,13 @@ func recoverLive(ctx context.Context, c Config, target *Target, bpf *BPF, l *log
 	if latency, confirmed := q.policy.Verify(now, row.Used, row.Consumed); confirmed && !q.recoveredReported {
 		f := fields(row)
 		f["latency"], f["writes"], f["attempts"] = latency, q.policy.Writes, q.policy.Attempts
-		l.emit("recovered", f)
+		l.emit("progress_after_kick", f)
 		q.recoveredReported = true
 	}
-	if !attempt {
+	if !candidate {
 		return l.err
 	}
-	if row.Used != q.used || row.Pending == 0 || uint32(row.Pending) > s.Num || uint32(row.Outstanding) > s.Num || row.Busy {
+	if row.Used != q.used || row.Pending == 0 || uint32(row.Pending) > s.Num || uint32(row.Outstanding) > s.Num || row.WorkQueued {
 		q.policy.Invalidate(now)
 		return nil
 	}
@@ -307,10 +317,10 @@ func recoverLive(ctx context.Context, c Config, target *Target, bpf *BPF, l *log
 	if !q.incident {
 		f := fields(row)
 		f["age"], f["confirmation"] = now-q.policy.Progress.Since, "cached_completion_progress_and_live_pending"
-		l.emit("stall", f)
+		l.emit("candidate", f)
 		q.incident = true
 	}
-	if l.err != nil {
+	if l.err != nil || c.Mode != "recover" {
 		return l.err
 	}
 	if err := ctx.Err(); err != nil {
@@ -337,5 +347,8 @@ func recoverLive(ctx context.Context, c Config, target *Target, bpf *BPF, l *log
 		return err
 	}
 	q.policy.Written(monotonic(), row.Used, row.Consumed)
-	return nil
+	f := fields(row)
+	f["writes"], f["progress"] = q.policy.Writes, "unconfirmed"
+	l.emit("kick_written", f)
+	return l.err
 }
