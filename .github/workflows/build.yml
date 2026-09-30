@@ -34,6 +34,7 @@ jobs:
       - name: Test native packages, vet, and build Linux commands
         run: |
           test -z "$(gofmt -l cmd internal)"
+          python3 .github/tests/test_image_publication.py
           go test -race -count=1 ./...
           go vet ./...
           GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -trimpath ./cmd/...
@@ -47,7 +48,7 @@ jobs:
           kernel_build=$(find /usr/src -maxdepth 1 -type d -name 'linux-headers-*-generic' | sort -V | tail -1)
           test -n "$kernel_build"
           make -C fault-injection/host KDIR="$kernel_build" CC=gcc-12
-          shellcheck deploy/run.sh deploy/fault.sh
+          shellcheck deploy/run.sh deploy/fault.sh .github/scripts/validate-image.sh
 
   images:
     if: github.event_name == 'pull_request'
@@ -83,10 +84,7 @@ jobs:
         env:
           IMAGE: vhost-ci:${{ matrix.target }}
           EXPECTED_REVISION: ${{ github.sha }}
-        run: |
-          revision=$(docker image inspect "$IMAGE" --format '{{ index .Config.Labels "org.opencontainers.image.revision" }}')
-          test "$revision" = "$EXPECTED_REVISION"
-          docker run --rm --network none --read-only --cap-drop ALL --security-opt no-new-privileges "$IMAGE" --help
+        run: bash .github/scripts/validate-image.sh
 
   publish:
     if: github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main')
@@ -169,21 +167,31 @@ jobs:
           file: deploy/Containerfile
           target: ${{ matrix.target }}
           platforms: linux/amd64
-          push: true
+          push: false
+          load: true
           tags: ${{ steps.metadata.outputs.tags }}
           labels: ${{ steps.metadata.outputs.labels }}
           cache-from: type=gha,scope=${{ matrix.target }}
           cache-to: type=gha,mode=max,scope=${{ matrix.target }}
+      - name: Validate immutable local image before publishing it
+        id: publish
+        env:
+          IMAGE: ${{ steps.build.outputs.imageid }}
+          EXPECTED_REVISION: ${{ github.sha }}
+          IMAGE_NAME: ${{ steps.image.outputs.name }}
+          PUBLISH_TAGS: ${{ steps.metadata.outputs.tags }}
+        run: bash .github/scripts/validate-image.sh
       - name: Verify published digest, revision, unprivileged help, and current privacy
         env:
           IMAGE: ${{ steps.image.outputs.name }}
-          DIGEST: ${{ steps.build.outputs.digest }}
+          DIGEST: ${{ steps.publish.outputs.digest }}
           EXPECTED_REVISION: ${{ github.sha }}
           REPOSITORY: ${{ github.repository }}
           PACKAGE_ENDPOINT: ${{ steps.privacy.outputs.endpoint }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           docker pull "$IMAGE@$DIGEST"
+          test "$(docker image inspect "$IMAGE@$DIGEST" --format '{{.Id}}')" = "${{ steps.publish.outputs.image_id }}"
           revision=$(docker image inspect "$IMAGE@$DIGEST" --format '{{ index .Config.Labels "org.opencontainers.image.revision" }}')
           test "$revision" = "$EXPECTED_REVISION"
           docker run --rm --network none --read-only --cap-drop ALL --security-opt no-new-privileges "$IMAGE@$DIGEST" --help
