@@ -11,7 +11,7 @@ The agent runs in a container on the QEMU Host. It supports multiple QEMU PIDs, 
 - For domain regex selection, mount the libvirt runtime XML directory (normally `/run/libvirt/qemu`). This is read-only discovery and requires no libvirt socket access.
 - For fault injection, matching Host kernel headers under `/lib/modules` and `/usr/src`, loadable kernel modules, and a matching compiler. The fault image includes GCC 12; supported Host kernels include Ubuntu `6.8.0-52-generic` and `6.17.0-20-generic`. Other kernels require validation of their vhost internals. Kernel lockdown or module-signing policy may prevent injection.
 
-The GHCR packages are public; private installations require authentication. Log in using a GitHub token with `read:packages` access as the password when prompted:
+Public repository publication requires existing public GHCR packages; CI never changes package visibility. Private installations require authentication. Log in using a GitHub token with `read:packages` access as the password when prompted:
 
 ```sh
 sudo podman login ghcr.io -u YOUR_GITHUB_USER
@@ -145,4 +145,4 @@ sudo podman build --target fault -f deploy/Containerfile -t localhost/vhost-faul
 
 `make build` requires Go 1.25 or later, Clang, libbpf headers, and a Linux x86-64 build environment. To use local images, replace the GHCR image reference in a command with the corresponding `localhost/...:dev` tag. Choose a different `--name` when running concurrent inspections or one-shot calls.
 
-GitHub Actions run Go race tests and vet, compile BPF and the Host module, and build both Linux amd64 images. Pushes to `main`, version tags, and manual runs publish to GHCR using `GITHUB_TOKEN`, then pull each digest and verify its revision, CLI, and package visibility. Tags include `main`, full `sha-<commit>`, and version tags for `v*` releases. Private repository publication requires private package visibility; publication does not make either package public.
+GitHub Actions run Go race tests and vet, compile BPF and the Host module, and build both Linux amd64 images. Pushes to `main`, version tags, and manual runs publish to GHCR using `GITHUB_TOKEN` after validating the local image and current package visibility, then pull each digest and verify its revision, CLI, and current visibility again. Tags include `main`, full `sha-<commit>`, and version tags for `v*` releases. Public repositories require existing public packages; private repositories require private packages. A missing public package stops before publication because [GHCR defaults first publication to private](https://docs.github.com/en/packages/working-with-a-github-packages-registry/working-with-the-container-registry#pushing-container-images). Initial public publication and any visibility change require separate owner approval; this workflow does not bootstrap public packages or change sharing.

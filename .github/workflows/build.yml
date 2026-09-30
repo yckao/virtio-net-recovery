@@ -35,6 +35,7 @@ jobs:
         run: |
           test -z "$(gofmt -l cmd internal)"
           python3 .github/tests/test_image_publication.py
+          python3 .github/tests/test_package_visibility.py
           go test -race -count=1 ./...
           go vet ./...
           GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -trimpath ./cmd/...
@@ -123,7 +124,11 @@ jobs:
         run: |
           repository_info=$(gh api "repos/$REPOSITORY" --jq '[.private, .owner.type] | @tsv')
           IFS=$'\t' read -r private owner_type <<< "$repository_info"
-          case "$private" in true|false) ;; *) exit 1 ;; esac
+          case "$private" in
+            true) expected_visibility=private ;;
+            false) expected_visibility=public ;;
+            *) exit 1 ;;
+          esac
           case "$owner_type" in
             User) namespace=users ;;
             Organization) namespace=orgs ;;
@@ -138,10 +143,17 @@ jobs:
             visibility=$(tail -n 1 "$response")
             case "$visibility" in public|private|internal) ;; *) exit 1 ;; esac
             echo "Current repository private=$private; package visibility=$visibility"
-            if [ "$private" = true ]; then test "$visibility" = private; fi
+            if [ "$visibility" != "$expected_visibility" ]; then
+              echo "Refusing publication: $endpoint must be $expected_visibility. CI does not change package visibility." >&2
+              exit 1
+            fi
           else
             status=$(awk '/^HTTP\/[0-9.]+ / {print $2; exit}' "$response")
             if [ "$status" != 404 ]; then cat "$response" >&2; exit 1; fi
+            if [ "$private" = false ]; then
+              echo "Refusing publication: public repository requires an existing public package at $endpoint. First GHCR publication defaults to private; bootstrap requires separate owner approval." >&2
+              exit 1
+            fi
             echo "Package does not exist yet; verify visibility after first publication."
           fi
       - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
@@ -201,7 +213,7 @@ jobs:
           echo "Current repository private=$private; package visibility=$visibility"
           case "$private" in
             true) test "$visibility" = private ;;
-            false) ;;
+            false) test "$visibility" = public ;;
             *) exit 1 ;;
           esac
           echo "$IMAGE@$DIGEST" >> "$GITHUB_STEP_SUMMARY"
