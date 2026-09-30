@@ -13,23 +13,86 @@ import (
 )
 
 type recoveryQueue struct {
-	fd                              int
-	snapshot                        Snapshot
-	policy                          *RecoveryPolicy
-	avail, used                     uint16
-	lastLive, quietSince, sampledAt float64
-	incident, recoveredReported     bool
-	lastError                       string
+	fd                               int
+	snapshot                         Snapshot
+	policy                           *RecoveryPolicy
+	avail, used                      uint16
+	lastLive, sampledAt              float64
+	lastError                        string
+	journal                          *EpisodeJournal
+	lastDecision                     EpisodeReason
+	lastEventID, verificationEventID string
+}
+
+func (q *recoveryQueue) ensureJournal(l *logger) {
+	if q.journal == nil {
+		q.journal = NewEpisodeJournal(func(event string, fields map[string]any) {
+			fields["vhost_fd"], fields["eventfd_id"], fields["num"] = q.fd, q.snapshot.EventID, q.snapshot.Num
+			if event == "candidate" {
+				q.lastEventID = fields["event_id"].(string)
+			}
+			l.emit(event, fields)
+		}, monotonic)
+	}
+}
+
+func (q *recoveryQueue) decision(reason EpisodeReason) {
+	q.lastDecision = reason
+	q.journal.RecordDecision(reason)
+}
+
+func (q *recoveryQueue) closeEpisode(outcome EpisodeOutcome) {
+	if q.journal != nil {
+		q.journal.Close(outcome)
+	}
+}
+
+func (q *recoveryQueue) clock() float64 {
+	if q.journal != nil {
+		return q.journal.now()
+	}
+	return monotonic()
+}
+
+func (q *recoveryQueue) forgetVerification() {
+	q.policy.verification = nil
+	q.verificationEventID = ""
+}
+
+func (q *recoveryQueue) observeCached(l *logger, at float64, ready bool) {
+	q.ensureJournal(l)
+	invalid := uint32(q.avail-q.used) > q.snapshot.Num
+	q.journal.Observe(EpisodeSample{At: at, Avail: q.avail, Used: q.used,
+		Source: EpisodeSourceUser, Consumed: q.snapshot.LastAvail,
+		WorkQueued: q.snapshot.WorkFlags&(1<<1) != 0, Invalid: invalid}, ready)
+	if invalid {
+		q.decision(EpisodeReasonInvalidRing)
+		q.closeEpisode(EpisodeOutcomeInvalidRing)
+	} else if ready {
+		q.journal.Open(EpisodeReasonCandidate)
+	}
+}
+
+func (q *recoveryQueue) tickDiagnostics(l *logger, now, verifyTimeout float64) {
+	q.journal.Tick()
+	if q.policy.Unconfirmed(now, verifyTimeout) {
+		f := q.summary(now)
+		f["event_id"], f["outcome"] = q.verificationEventID, EpisodeOutcomeTimeout
+		l.emit("recovery_unconfirmed", f)
+	}
 }
 
 func (q *recoveryQueue) summary(now float64) map[string]any {
 	return map[string]any{"vhost_fd": q.fd, "eventfd_id": q.snapshot.EventID,
 		"num": q.snapshot.Num, "avail": q.avail, "used": q.used,
-		"outstanding": q.avail - q.used, "incident": q.incident,
+		"outstanding": q.avail - q.used, "episode_open": q.journal != nil && q.journal.Active(),
+		"event_id": q.lastEventID, "last_decision": q.lastDecision,
 		"attempts": q.policy.Attempts, "writes": q.policy.Writes,
 		"max_attempt_gap": q.policy.MaxAttemptGap,
-		"refusals":        q.policy.Refusals, "confirmed": q.policy.Confirmed,
-		"unconfirmed_age": q.policy.PendingAge(now), "indices_sample_at": q.sampledAt}
+		"refusals":        q.policy.Refusals, "write_errors": q.policy.WriteErrors, "confirmed": q.policy.Confirmed,
+		"verification_event_id": q.verificationEventID, "verification_pending": q.policy.verification != nil,
+		"verification_timed_out": q.policy.verification != nil && q.policy.verification.unconfirmed,
+		"unconfirmed_age":        q.policy.PendingAge(now), "indices_sample_at": q.sampledAt}
 }
 
 // runRecover has one common cadence, one batched user-ring read per healthy
@@ -41,10 +104,10 @@ func runRecover(ctx context.Context, c Config, target *Target, bpf *BPF, l *logg
 	lastLoop, maxLoopGap := started, float64(0)
 	queues := []*recoveryQueue{}
 	known := map[int]*recoveryQueue{}
-	var pendingCleanup map[int]Snapshot
+	var pendingCleanup map[int]*recoveryQueue
 	policies := map[int]*RecoveryPolicy{}
 	var batch *RingBatch
-	var attempts, refusals, pollErrors uint64
+	var attempts, writeErrors, refusals, pollErrors uint64
 	var progress recoveryProgressTotals
 	forceInventory := true
 	lastInventoryError := ""
@@ -75,16 +138,22 @@ func runRecover(ctx context.Context, c Config, target *Target, bpf *BPF, l *logg
 					"error": discoveryFailures[fd], "previously_supported": false})
 			}
 		}
-		return map[string]any{"attempts": attempts, "writes": progress.writes, "refusals": refusals, "confirmed": progress.confirmed,
+		return map[string]any{"attempts": attempts, "writes": progress.writes, "write_errors": writeErrors, "refusals": refusals, "confirmed": progress.confirmed,
 			"poll_errors": pollErrors, "max_poll_gap": max(maxPollGap, now-lastPoll), "max_loop_gap": maxLoopGap,
 			"queues": rows, "unavailable_queues": len(unavailable), "source": "cached_user_indices"}
 	}
 	defer func() {
 		current := make(map[int]Snapshot, len(known))
+		pending := make(map[int]Snapshot, len(pendingCleanup))
+		for fd, q := range pendingCleanup {
+			q.closeEpisode(EpisodeOutcomeStopped)
+			pending[fd] = q.snapshot
+		}
 		for fd, q := range known {
+			q.closeEpisode(EpisodeOutcomeStopped)
 			current[fd] = q.snapshot
 		}
-		forgetSnapshotSets(current, pendingCleanup, bpf.Forget)
+		forgetSnapshotSets(current, pending, bpf.Forget)
 		l.emit("stopped", summary(monotonic()))
 		if result == nil {
 			result = l.err
@@ -119,6 +188,8 @@ func runRecover(ctx context.Context, c Config, target *Target, bpf *BPF, l *logg
 				forceInventory = true
 				for _, q := range queues {
 					q.policy.Invalidate(now)
+					q.decision(EpisodeReasonUnavailable)
+					q.closeEpisode(EpisodeOutcomeUnavailable)
 				}
 				if err.Error() != lastInventoryError {
 					l.emit("inventory_unavailable", map[string]any{"error": err.Error()})
@@ -127,10 +198,10 @@ func runRecover(ctx context.Context, c Config, target *Target, bpf *BPF, l *logg
 			} else {
 				lastInventoryError = ""
 				old := map[int]*recoveryQueue{}
-				pendingCleanup = make(map[int]Snapshot, len(known))
+				pendingCleanup = make(map[int]*recoveryQueue, len(known))
 				for fd, q := range known {
 					old[fd] = q
-					pendingCleanup[fd] = q.snapshot
+					pendingCleanup[fd] = q
 				}
 				queues = nil
 				known = map[int]*recoveryQueue{}
@@ -159,11 +230,13 @@ func runRecover(ctx context.Context, c Config, target *Target, bpf *BPF, l *logg
 						policies[remoteFD] = p
 					}
 					if q != nil && q.snapshot.Identity() != s.Identity() {
+						q.decision(EpisodeReasonIdentityChange)
+						q.closeEpisode(EpisodeOutcomeIdentityChange)
 						bpf.Forget(q.snapshot)
 						l.emit("queue_reconfigured", map[string]any{"vhost_fd": remoteFD, "unconfirmed_age": p.PendingAge(now)})
 						// Preserve slot pacing and counters; an old attachment's
 						// verification can never confirm a replacement attachment.
-						p.verification = nil
+						q.forgetVerification()
 						p.Invalidate(now)
 						q = nil
 					}
@@ -171,6 +244,8 @@ func runRecover(ctx context.Context, c Config, target *Target, bpf *BPF, l *logg
 						q = &recoveryQueue{fd: remoteFD, policy: p, lastLive: math.Inf(-1)}
 					}
 					q.snapshot, q.avail, q.used, q.sampledAt = s, row.Avail, row.Used, monotonic()
+					q.ensureJournal(l)
+					q.journal.Observe(liveEpisodeSample(row, q.sampledAt), false)
 					known[remoteFD] = q
 					queues = append(queues, q)
 					snapshots = append(snapshots, s)
@@ -181,10 +256,14 @@ func runRecover(ctx context.Context, c Config, target *Target, bpf *BPF, l *logg
 						// identity; preserve its first verification baseline.
 						known[q.fd] = q
 						q.policy.Invalidate(now)
+						q.decision(EpisodeReasonUnavailable)
+						q.closeEpisode(EpisodeOutcomeUnavailable)
 						continue
 					}
 					bpf.Forget(q.snapshot)
-					q.policy.verification = nil
+					q.decision(EpisodeReasonIdentityChange)
+					q.closeEpisode(EpisodeOutcomeIdentityChange)
+					q.forgetVerification()
 					q.policy.Invalidate(now)
 				}
 				// All old queues are either transferred into known or forgotten.
@@ -211,6 +290,8 @@ func runRecover(ctx context.Context, c Config, target *Target, bpf *BPF, l *logg
 				batch = nil
 				for _, q := range queues {
 					q.policy.Invalidate(now)
+					q.decision(EpisodeReasonUnavailable)
+					q.closeEpisode(EpisodeOutcomeUnavailable)
 				}
 				forceInventory = true
 			} else {
@@ -224,11 +305,7 @@ func runRecover(ctx context.Context, c Config, target *Target, bpf *BPF, l *logg
 					q.avail, q.used = batch.Indices(index)
 					q.sampledAt = sampledAt
 					ready := q.policy.Observe(q.avail, q.used, q.snapshot.Num, sampledAt)
-					if ready {
-						q.quietSince = 0
-					} else if q.quietSince == 0 {
-						q.quietSince = now
-					}
+					q.observeCached(l, sampledAt, ready)
 					verify := q.policy.NeedsVerification(q.used)
 					if (ready || verify) && now-q.lastLive >= c.Interval {
 						inspect := ready && (c.Mode == "observe" || q.policy.Attempt(now))
@@ -238,40 +315,42 @@ func runRecover(ctx context.Context, c Config, target *Target, bpf *BPF, l *logg
 							if attempt {
 								attempts++
 							}
-							beforeWrites, beforeConfirmed := q.policy.Writes, q.policy.Confirmed
+							beforeWrites, beforeConfirmed, beforeRefusals := q.policy.Writes, q.policy.Confirmed, q.policy.Refusals
 							err := recoverLive(ctx, c, target, bpf, l, q, inspect)
 							q.lastLive = monotonic()
 							if attempt {
 								q.policy.FinishAttempt(q.lastLive)
 							}
 							progress.add(q.policy, beforeWrites, beforeConfirmed)
+							if l.err != nil {
+								return l.err
+							}
 							if err != nil {
 								if ctx.Err() != nil {
 									return l.err
 								}
 								event := "recovery_refused"
-								if q.policy.Refused(attempt) {
-									refusals++
-								} else {
+								var writeErr *KickWriteError
+								if errors.As(err, &writeErr) {
+									q.policy.WriteErrors++
+									writeErrors++
+									event = "recovery_write_failed"
+								} else if !q.policy.Refused(attempt) {
 									pollErrors++
 									event = "observation_unavailable"
 								}
 								q.policy.Invalidate(now)
 								forceInventory = true
 								if q.lastError != err.Error() {
-									l.emit(event, map[string]any{"vhost_fd": q.fd, "error": err.Error()})
+									l.emit(event, map[string]any{"vhost_fd": q.fd, "event_id": q.lastEventID,
+										"reason": q.lastDecision, "error": err.Error()})
 									q.lastError = err.Error()
 								}
 							} else {
 								q.lastError = ""
 							}
+							refusals += q.policy.Refusals - beforeRefusals
 						}
-					}
-					// Hysteresis suppresses reports only. A new candidate is
-					// always eligible for paced recovery during this quiet period.
-					if q.incident && q.policy.verification == nil && q.quietSince != 0 && now-q.quietSince >= 1 {
-						l.emit("incident_closed", q.summary(now))
-						q.incident, q.recoveredReported = false, false
 					}
 				}
 			}
@@ -279,9 +358,7 @@ func runRecover(ctx context.Context, c Config, target *Target, bpf *BPF, l *logg
 		// Coverage loss must not postpone the original verification deadline.
 		// Preserve the baseline so later live progress can still be observed.
 		for _, q := range known {
-			if q.policy.Unconfirmed(now, c.VerifyTimeout) {
-				l.emit("recovery_unconfirmed", q.summary(now))
-			}
+			q.tickDiagnostics(l, monotonic(), c.VerifyTimeout)
 		}
 		if now-lastSummary >= c.SummaryInterval {
 			l.emit("sample", summary(now))
@@ -298,34 +375,104 @@ func runRecover(ctx context.Context, c Config, target *Target, bpf *BPF, l *logg
 	}
 }
 
-func recoverLive(ctx context.Context, c Config, target liveQueueTarget, bpf snapshotter, l *logger, q *recoveryQueue, candidate bool) error {
+func liveEpisodeSample(row QueueRow, at float64) EpisodeSample {
+	return EpisodeSample{At: at, Avail: row.Avail, Used: row.Used,
+		Source: EpisodeSourceLive, Consumed: row.Consumed, ConsumedFresh: true,
+		WorkQueued: row.WorkQueued, WorkQueuedFresh: true}
+}
+
+func liveRecoveryDecision(s Snapshot, row QueueRow, cachedUsed uint16) EpisodeReason {
+	switch {
+	case uint32(row.Pending) > s.Num || uint32(row.Outstanding) > s.Num:
+		return EpisodeReasonInvalidRing
+	case row.Used != cachedUsed:
+		return EpisodeReasonUsedProgress
+	case row.Outstanding == 0:
+		return EpisodeReasonDrained
+	case row.WorkQueued:
+		return EpisodeReasonBusy
+	case row.Pending == 0:
+		return EpisodeReasonNoPending
+	default:
+		return EpisodeReasonUnconsumed
+	}
+}
+
+func recoverLive(ctx context.Context, c Config, target liveQueueTarget, bpf snapshotter, l *logger, q *recoveryQueue, candidate bool) (result error) {
+	writesBefore := q.policy.Writes
+	if q.journal == nil {
+		q.observeCached(l, q.clock(), candidate)
+	} else if candidate {
+		q.journal.Open(EpisodeReasonCandidate)
+	}
+	q.lastDecision = EpisodeReasonUnavailable
+	defer func() {
+		if result == nil || q.policy.Writes > writesBefore {
+			return
+		}
+		var writeErr *KickWriteError
+		writeResult := EpisodeWriteRefused
+		if errors.As(result, &writeErr) {
+			q.lastDecision = EpisodeReasonWriteFailed
+			writeResult = EpisodeWriteError
+		} else if errors.Is(result, ErrKickIdentityChanged) {
+			q.lastDecision = EpisodeReasonIdentityChange
+		} else if errors.Is(result, context.Canceled) || errors.Is(result, context.DeadlineExceeded) {
+			q.lastDecision = EpisodeReasonCancelled
+		}
+		q.decision(q.lastDecision)
+		if candidate && c.Mode == "recover" {
+			q.journal.RecordWrite(writeResult, q.lastDecision)
+		}
+		switch q.lastDecision {
+		case EpisodeReasonIdentityChange:
+			q.closeEpisode(EpisodeOutcomeIdentityChange)
+			q.forgetVerification()
+		case EpisodeReasonUnavailable:
+			q.closeEpisode(EpisodeOutcomeUnavailable)
+		}
+	}()
 	s, row, err := liveRow(target, bpf, q.fd)
 	if err != nil {
 		return err
 	}
 	if s.Identity() != q.snapshot.Identity() {
+		q.decision(EpisodeReasonIdentityChange)
 		return errors.New("queue identity changed during cached ring polling")
 	}
-	now := monotonic()
-	if latency, confirmed := q.policy.Verify(now, row.Used, row.Consumed); confirmed && !q.recoveredReported {
+	now := q.clock()
+	decision := liveRecoveryDecision(s, row, q.used)
+	q.decision(decision)
+	sample := liveEpisodeSample(row, now)
+	sample.Invalid = decision == EpisodeReasonInvalidRing
+	q.journal.Observe(sample, candidate && decision == EpisodeReasonUnconsumed)
+	if decision == EpisodeReasonInvalidRing {
+		if candidate && c.Mode == "recover" {
+			q.policy.Refused(true)
+			q.journal.RecordWrite(EpisodeWriteRefused, decision)
+		}
+		q.closeEpisode(EpisodeOutcomeInvalidRing)
+		q.policy.Invalidate(now)
+		return nil
+	}
+	verificationTimedOut := q.policy.verification != nil && q.policy.verification.unconfirmed
+	if latency, confirmed := q.policy.Verify(now, row.Used, row.Consumed); confirmed {
 		f := fields(row)
 		f["latency"], f["writes"], f["attempts"] = latency, q.policy.Writes, q.policy.Attempts
+		f["event_id"], f["outcome"], f["verification_timed_out"] = q.verificationEventID, EpisodeOutcomeBoth, verificationTimedOut
 		l.emit("progress_after_kick", f)
-		q.recoveredReported = true
+		q.verificationEventID = ""
 	}
 	if !candidate {
 		return l.err
 	}
-	if row.Used != q.used || row.Pending == 0 || uint32(row.Pending) > s.Num || uint32(row.Outstanding) > s.Num || row.WorkQueued {
+	if decision != EpisodeReasonUnconsumed {
+		if c.Mode == "recover" {
+			q.policy.Refused(true)
+			q.journal.RecordWrite(EpisodeWriteRefused, decision)
+		}
 		q.policy.Invalidate(now)
 		return nil
-	}
-	row.Stalled = true
-	if !q.incident {
-		f := fields(row)
-		f["age"], f["confirmation"] = now-q.policy.Progress.Since, "cached_completion_progress_and_live_pending"
-		l.emit("candidate", f)
-		q.incident = true
 	}
 	if l.err != nil || c.Mode != "recover" {
 		return l.err
@@ -335,27 +482,39 @@ func recoverLive(ctx context.Context, c Config, target liveQueueTarget, bpf snap
 	}
 	if c.CheckIdentity != nil {
 		if err := c.CheckIdentity(); err != nil {
+			q.decision(EpisodeReasonIdentityChange)
 			return err
 		}
 	}
 	vhosts, events, err := target.Inventory()
 	if err != nil {
+		q.decision(EpisodeReasonUnavailable)
 		return err
 	}
 	if !slices.Contains(vhosts, q.fd) {
+		q.decision(EpisodeReasonIdentityChange)
 		return errors.New("vhost FD disappeared before recovery")
 	}
 	fd, err := target.Duplicate(q.fd)
 	if err != nil {
+		q.decision(EpisodeReasonUnavailable)
 		return err
 	}
 	defer unix.Close(fd)
+	if q.policy.verification == nil {
+		q.journal.OpenForWrite(EpisodeReasonCandidate)
+	}
+	if l.err != nil {
+		return l.err
+	}
 	if err := RekickContext(ctx, target, bpf, fd, s, events); err != nil {
+		q.lastDecision = EpisodeReasonUnavailable
 		return err
 	}
-	q.policy.Written(monotonic(), row.Used, row.Consumed)
-	f := fields(row)
-	f["writes"], f["progress"] = q.policy.Writes, "unconfirmed"
-	l.emit("kick_written", f)
+	if q.policy.verification == nil {
+		q.verificationEventID = q.journal.EventID()
+	}
+	q.policy.Written(q.clock(), row.Used, row.Consumed)
+	q.journal.RecordWrite(EpisodeWriteSuccess, EpisodeReasonUnconsumed)
 	return l.err
 }

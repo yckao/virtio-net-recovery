@@ -62,6 +62,10 @@ func TestRekickCancellationAfterLiveSnapshotRefusesWrite(t *testing.T) {
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("wrong cancellation result: %v", err)
 	}
+	var writeErr *KickWriteError
+	if errors.As(err, &writeErr) {
+		t.Fatal("cancelled recovery classified as a write failure")
+	}
 	if n, err := unix.Poll([]unix.PollFd{{Fd: int32(fd), Events: unix.POLLIN}}, 0); err != nil || n != 0 {
 		t.Fatal("cancelled recovery wrote to eventfd")
 	}
@@ -163,6 +167,10 @@ func TestVerifiedRekickAndRefusals(t *testing.T) {
 			if (err == nil) != (name == "valid") {
 				t.Fatalf("unexpected result: %v", err)
 			}
+			var writeErr *KickWriteError
+			if errors.As(err, &writeErr) {
+				t.Fatal("safety refusal classified as a write failure")
+			}
 			poll := []unix.PollFd{{Fd: int32(fd), Events: unix.POLLIN}}
 			n, err := unix.Poll(poll, 0)
 			if err != nil {
@@ -193,6 +201,35 @@ func TestVerifiedRekickAndRefusals(t *testing.T) {
 				t.Fatal("changed shared file flags")
 			}
 		})
+	}
+}
+
+func TestRekickEventfdFullReturnsWriteError(t *testing.T) {
+	fd, err := unix.Eventfd(0, unix.EFD_CLOEXEC|unix.EFD_NONBLOCK)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer unix.Close(fd)
+	id, err := eventID("self", fd)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var data [8]byte
+	const full = ^uint64(0) - 1
+	binary.NativeEndian.PutUint64(data[:], full)
+	if n, err := unix.Write(fd, data[:]); err != nil || n != len(data) {
+		t.Fatalf("could not fill eventfd: %d %v", n, err)
+	}
+	s := configured()
+	s.EventID = id
+	target := &testTarget{source: fd, duplicate: -1, alive: true}
+	err = Rekick(target, testBPF{value: s}, 33, s, map[uint32][]int{id: {66}})
+	var writeErr *KickWriteError
+	if !errors.As(err, &writeErr) || !errors.Is(err, unix.EAGAIN) {
+		t.Fatalf("full eventfd did not return a wrapped write failure: %v", err)
+	}
+	if n, err := unix.Read(fd, data[:]); err != nil || n != len(data) || binary.NativeEndian.Uint64(data[:]) != full {
+		t.Fatalf("failed kick changed the eventfd counter: %d %v %v", n, data, err)
 	}
 }
 

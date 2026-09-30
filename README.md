@@ -78,6 +78,14 @@ sudo podman stop --time 10 vhost-watch
 
 Stopping detaches probes and releases process locks. Repeat the start command to restart a container created with `--rm`. Journald retention is controlled by the Host's journal configuration.
 
+### Candidate journal
+
+Each queue keeps the latest **16 existing poll samples** in a fixed-size memory ring. A candidate opens one episode per queue and emits these pre/current snapshots with an `event_id`; later snapshot, write and closing records use the same ID. IDs combine a random process prefix with a process-wide sequence. The journal adds no extra sampling or disk files. Podman sends each single-line JSON stdout record to journald.
+
+An episode has a **30-second diagnostic deadline**, enforced at the next completed cycle, including unavailable-poll checks; scheduling or live validation can delay its wall-clock close. It also closes after a candidate has been absent for **1 second**, or when its identity changes, its queue becomes unavailable, its indices become inconsistent, or the agent stops. Routine reopening waits **1 second** after closing. A paced recovery attempt starting a new verification may open an episode immediately so its first write has an active origin ID; observe never uses this exception. Subsequent snapshots and write totals share routine aggregation of one record per second, with immediate candidate, first-write and closing records. These journal limits do not delay recovery attempts. Closing reports distinguish Host descriptor consumption (`last_avail`), used-ring completion progress, both, quiet without observed progress, timeout, identity change, unavailability, invalid ring and stop. Write success, write error and validation refusal have separate totals and fixed reasons.
+
+Snapshots identify cached user indices versus a live snapshot. Host descriptor consumption and queued-work values are meaningful only when their freshness flags are set; consumption does not prove backend transmission or receiver delivery. `after_write` means only that the latest sample was taken after the first accepted write; progress can predate that write and does not prove causation or a lost notification. The **30-second episode timeout** bounds diagnostics; the separate `--verify-timeout` bounds the wait before reporting `recovery_unconfirmed`. Recovery verification retains the first write's baseline and originating `event_id` across episode closure or reopening. `progress_after_kick` and `recovery_unconfirmed` refer to that origin, and summaries retain the pending verification ID and timeout state. Neither timeout stops recovery retries.
+
 ### Manual kick
 
 Write one verified kick to every selected TX slot and exit:

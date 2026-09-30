@@ -18,7 +18,7 @@ if [ -n "${VHOST_WATCH_CPUSET:-}" ]; then
     set -- --cpuset-cpus "$VHOST_WATCH_CPUSET" "$@"
 fi
 exec "${CONTAINER_ENGINE:-podman}" run $detach --rm --name "${VHOST_WATCH_NAME:-vhost-watch}" --privileged --pid=host --network=none \
-    --log-driver=k8s-file --log-opt=max-size=10mb \
+    --log-driver=journald \
     --read-only --security-opt label=disable \
     -v /sys/kernel/btf:/sys/kernel/btf:ro \
     -v /run/libvirt/qemu:/run/libvirt/qemu:ro \
