@@ -427,8 +427,7 @@ func recordRecoveryMetrics(w *WorkerMetrics, known map[int]*recoveryQueue, failu
 			unavailable++
 		}
 	}
-	w.SetGauges(open, sampled, max(0, unavailable))
-	w.ObservePoll(time.Duration(gap*float64(time.Second)), failed)
+	w.RecordPoll(open, sampled, max(0, unavailable), time.Duration(gap*float64(time.Second)), failed)
 }
 
 func liveEpisodeSample(row QueueRow, at float64) EpisodeSample {

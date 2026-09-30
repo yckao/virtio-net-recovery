@@ -81,42 +81,30 @@ func (m *Metrics) RegisterWorker() (*WorkerMetrics, error) {
 	return w, nil
 }
 
-// SetGauges replaces this worker's current values. Invalid and retired updates
-// are rejected; the exporter never retains retired keys.
-func (w *WorkerMetrics) SetGauges(open, sampled, unavailable int) bool {
-	if open < 0 || sampled < 0 || unavailable < 0 {
+// RecordPoll atomically replaces this worker's coverage and polling health.
+// Invalid and retired updates are rejected without changing any counters.
+func (w *WorkerMetrics) RecordPoll(open, sampled, unavailable int, gap time.Duration, failed bool) bool {
+	if open < 0 || sampled < 0 || unavailable < 0 || gap < 0 {
 		return false
 	}
 	m := w.metrics
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	g, ok := m.workers[w]
-	if ok {
-		g.open, g.sampled, g.unavailable = open, sampled, unavailable
-		m.workers[w] = g
-	}
-	return ok
-}
-
-// ObservePoll records elapsed time between cycles. A worker's first cycle can
-// use zero. Last/max gap gauges report the largest value among active workers.
-func (w *WorkerMetrics) ObservePoll(gap time.Duration, failed bool) {
-	m := w.metrics
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	g, ok := m.workers[w]
-	if !ok || gap < 0 {
-		return
+	if !ok {
+		return false
 	}
 	now := time.Now()
 	if !g.lastPollAt.IsZero() {
 		g.maxGap = max(g.maxGap, now.Sub(g.lastPollAt))
 	}
+	g.open, g.sampled, g.unavailable = open, sampled, unavailable
 	g.lastGap, g.maxGap, g.lastPollAt = gap, max(g.maxGap, gap), now
 	m.workers[w] = g
 	if failed {
 		m.counters.pollErrors++
 	}
+	return true
 }
 
 func (w *WorkerMetrics) Retire() {

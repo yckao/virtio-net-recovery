@@ -108,26 +108,26 @@ func TestMetricsFixedSeriesRejectLabelInjection(t *testing.T) {
 func TestMetricsAggregateAndRetireWorkers(t *testing.T) {
 	var m Metrics // Zero value works without NewMetrics.
 	a, b := newMetricWorker(t, &m), newMetricWorker(t, &m)
-	if !a.SetGauges(2, 3, 1) || !b.SetGauges(1, 7, 2) {
+	if !a.RecordPoll(2, 3, 1, time.Second, true) || !b.RecordPoll(1, 7, 2, 500*time.Millisecond, true) {
 		t.Fatal("active worker update rejected")
 	}
-	a.ObservePoll(time.Second, true)
-	a.ObservePoll(200*time.Millisecond, false)
-	b.ObservePoll(500*time.Millisecond, true)
+	a.RecordPoll(2, 3, 1, 200*time.Millisecond, false)
 	values := scrapeMetrics(t, &m)
 	for name, want := range map[string]float64{"open_episodes": 3, "sampled_queues": 10, "unavailable_queues": 3, "poll_gap_seconds": 0.5, "poll_max_gap_seconds": 1, "poll_errors_total": 2} {
 		requireMetric(t, values, name, want)
 	}
-	if a.SetGauges(-1, 0, 0) || a.SetGauges(0, -1, 0) || a.SetGauges(0, 0, -1) {
-		t.Fatal("negative gauges accepted")
+	before := m.workers[a]
+	if a.RecordPoll(-1, 0, 0, time.Second, true) || a.RecordPoll(0, -1, 0, time.Second, true) || a.RecordPoll(0, 0, -1, time.Second, true) || a.RecordPoll(0, 0, 0, -time.Second, true) {
+		t.Fatal("invalid poll update accepted")
 	}
-	b.ObservePoll(-time.Second, true)
+	if m.workers[a] != before {
+		t.Fatal("invalid poll update changed worker state")
+	}
 	a.Retire()
 	a.Retire()
-	if a.SetGauges(100, 100, 100) {
+	if a.RecordPoll(100, 100, 100, 10*time.Second, true) {
 		t.Fatal("retired worker update accepted")
 	}
-	a.ObservePoll(10*time.Second, true)
 	values = scrapeMetrics(t, &m)
 	for name, want := range map[string]float64{"open_episodes": 1, "sampled_queues": 7, "unavailable_queues": 2, "poll_gap_seconds": 0.5, "poll_max_gap_seconds": 0.5, "poll_errors_total": 2} {
 		requireMetric(t, values, name, want)
@@ -166,7 +166,7 @@ func TestMetricsPollAgeExposesStalledWorkerWithoutTimer(t *testing.T) {
 	m := NewMetrics()
 	w := newMetricWorker(t, m)
 	requireMetric(t, scrapeMetrics(t, m), "poll_gap_seconds", 0)
-	w.ObservePoll(100*time.Millisecond, false)
+	w.RecordPoll(0, 0, 0, 100*time.Millisecond, false)
 	m.mu.Lock()
 	g := m.workers[w]
 	g.lastPollAt = time.Now().Add(-2 * time.Second)
@@ -178,7 +178,7 @@ func TestMetricsPollAgeExposesStalledWorkerWithoutTimer(t *testing.T) {
 			t.Errorf("%s concealed a stalled poll: %v", name, values["vhost_watch_"+name])
 		}
 	}
-	w.ObservePoll(100*time.Millisecond, false)
+	w.RecordPoll(0, 0, 0, 100*time.Millisecond, false)
 	if scrapeMetrics(t, m)["vhost_watch_poll_max_gap_seconds"] < 2 {
 		t.Fatal("resumed polling discarded the observed stall duration")
 	}
@@ -217,8 +217,7 @@ func TestMetricsConcurrentUpdatesAndScrapes(t *testing.T) {
 				m.Decision(ReasonUnconsumed)
 				m.Write(WriteSuccess)
 				m.Progress(ProgressBoth)
-				w.SetGauges(1, 2, 1)
-				w.ObservePoll(time.Duration(i)*time.Millisecond, i%10 == 0)
+				w.RecordPoll(1, 2, 1, time.Duration(i)*time.Millisecond, i%10 == 0)
 			}
 		})
 	}
@@ -232,6 +231,27 @@ func TestMetricsConcurrentUpdatesAndScrapes(t *testing.T) {
 	}
 	requireMetric(t, values, "poll_errors_total", workers*cycles/10)
 	requireMetric(t, values, "open_episodes", 0)
+}
+
+func TestMetricsScrapeSeesWholePollUpdate(t *testing.T) {
+	m := NewMetrics()
+	w := newMetricWorker(t, m)
+	defer w.Retire()
+	var wg sync.WaitGroup
+	wg.Go(func() {
+		for i := 1; i <= 1000; i++ {
+			w.RecordPoll(i, i, i, time.Duration(i)*time.Hour, true)
+		}
+	})
+	for range 1000 {
+		values := scrapeMetrics(t, m)
+		sampled := values["vhost_watch_sampled_queues"]
+		for _, name := range []string{"open_episodes", "unavailable_queues", "poll_errors_total"} {
+			requireMetric(t, values, name, sampled)
+		}
+		requireMetric(t, values, "poll_gap_seconds", sampled*3600)
+	}
+	wg.Wait()
 }
 
 func TestMetricsHandlerRoutesAndMethods(t *testing.T) {

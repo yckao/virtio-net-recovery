@@ -19,8 +19,7 @@ func runTrace(ctx context.Context, c Config, target *Target, bpf *BPF, l *logger
 	lastCycle := monotonic()
 	finishMetrics := func() {
 		if pending && c.metricWorker != nil {
-			c.metricWorker.SetGauges(0, sampled, total-sampled)
-			c.metricWorker.ObservePoll(time.Duration(gap*float64(time.Second)), failed)
+			c.metricWorker.RecordPoll(0, sampled, total-sampled, time.Duration(gap*float64(time.Second)), failed)
 		}
 		pending = false
 	}
