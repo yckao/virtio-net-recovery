@@ -31,74 +31,89 @@ sudo podman run --rm --name vhost-queues --privileged --pid=host --network=none 
 
 `--list-queues` reports the current QEMU `vhost_fd` for each configured TX slot. A vhost FD is process-local and can change after restart or device reconfiguration; it is not a guest queue number. Select it from a fresh listing.
 
-## Start the agent
+## Four modes
 
-Observe without writing recovery kicks:
+| Mode | Behavior |
+| --- | --- |
+| `observe` (default) | Poll queues and report candidates; never write a recovery kick. |
+| `recover` | Use the same polling and candidate checks, validate live process/attachment/eventfd identity, write a kick when the checks pass, then observe backend consumption and used-ring progress. |
+| `kick` | Manually write one verified kick to each selected TX slot and exit. This intentionally bypasses candidate detection. |
+| `trace` | Diagnose the initially selected targets with additional eventfd/vhost stage probes for an explicit bounded duration. It never automatically kicks. |
+
+Build the current source before using this interface; an already published image may contain an older CLI:
 
 ```sh
-sudo podman run --detach --rm --name vhost-watch --privileged --pid=host --network=none --read-only --security-opt label=disable -v /sys/kernel/btf:/sys/kernel/btf:ro -v /var/lib/vhost-watch:/state:rw --log-driver=k8s-file --log-opt=max-size=10mb ghcr.io/yckao/virtio-net-recovery:main --pid 1234,5678 --mode observe
+sudo podman build --target agent -f deploy/Containerfile -t localhost/vhost-watch:dev .
+sudo mkdir -p /var/lib/vhost-watch
 ```
 
-Enable guarded recovery for matching domains:
+### Observe and recover
+
+Observe selected PIDs with single-line JSON stdout collected by Podman journald:
 
 ```sh
-sudo podman run --detach --rm --name vhost-watch --privileged --pid=host --network=none --read-only --security-opt label=disable -v /sys/kernel/btf:/sys/kernel/btf:ro -v /var/lib/vhost-watch:/state:rw --log-driver=k8s-file --log-opt=max-size=10mb -v /run/libvirt/qemu:/run/libvirt/qemu:ro ghcr.io/yckao/virtio-net-recovery:main --domain-regex '^worker-' --mode guarded --batch-rings --interval 0.02 --threshold 0.04
+sudo podman run --detach --rm --name vhost-watch --privileged --pid=host --network=none --read-only --security-opt label=disable -v /sys/kernel/btf:/sys/kernel/btf:ro -v /var/lib/vhost-watch:/state:rw --log-driver=journald localhost/vhost-watch:dev --pid 1234,5678 --mode observe
 ```
 
-The example checks ring progress every 20 ms, then confirms a suspected stall against live vhost state twice before writing. A shared BPF snapshot probe serves all selected VMs. Recovery verifies the current QEMU process, vhost attachment, and eventfd identity. It then checks for consumed/used progress. This confirms Host queue progress; service health needs a separate application check.
+Enable recovery for selected running domains:
 
-Per-queue defaults limit guarded recovery to one attempt every 30 seconds and three attempts per hour. Domain selection refreshes every five seconds (`--target-interval 5s`) and follows domain restarts. Explicit PIDs never follow a reused PID. Each VM has a separate observer lock and recovery state; use the same `/var/lib/vhost-watch` state directory for all containers.
+```sh
+sudo podman run --detach --rm --name vhost-watch --privileged --pid=host --network=none --read-only --security-opt label=disable -v /sys/kernel/btf:/sys/kernel/btf:ro -v /var/lib/vhost-watch:/state:rw -v /run/libvirt/qemu:/run/libvirt/qemu:ro --log-driver=journald localhost/vhost-watch:dev --domain-regex '^worker-' --mode recover
+```
 
-Polling and extra kicks have overhead. The 20 ms configuration is an experiment setting, not a throughput or latency guarantee. Five VMs with 60 RX/TX queue pairs each have not been qualified. `--trace-stages` adds traffic-path probes and should be reserved for diagnostics. `--mode periodic --kick-interval 0.1` sends unconditional kicks and is not the recommended default.
+Use one observing or recovering agent per selected process and share the state directory between containers. Domain selection refreshes every five seconds (`--target-interval 5s`) and can follow domain restarts. Explicit PIDs never follow a reused PID. Stop an existing observer before switching its selected processes to recovery.
+
+Both modes batch known user-ring reads every `--interval` (default **0.1 seconds**) and refresh the full QEMU FD inventory every `--inventory-interval` (default **5 seconds**). New or changed attachments can wait for the next inventory refresh. These defaults are candidate operating settings, not a guarantee against false kicks or a qualification of production overhead. A 25 ms cadence or a second live confirmation needs separate evidence before changing the policy.
+
+A candidate needs outstanding descriptors across at least two observations without completion progress, followed by a live snapshot showing unconsumed descriptors. The queued bit being zero does **not** prove the vhost worker is idle: Linux clears that bit before calling the work handler. The live checks refuse queued work; absence of queued work still does not establish worker idleness or the underlying cause of a stall.
+
+Every recovery attempt refreshes FD inventory and validates the QEMU process, pinned vhost attachment, waiter/backend and nonblocking eventfd. Attempts and failures are paced from the end of validation, so actual retry gaps can exceed the requested interval. Recover retries while a validated candidate persists. A successful eventfd write, backend descriptor consumption, used-ring progress, and a verification timeout are distinct observations. Progress after a kick does **not** prove a lost notification, packet delivery, or application recovery. `--verify-timeout` (default 5 seconds) reports a write without observed progress; it does not end recovery retries.
+
+Healthy summaries use cached user indices, not fresh kernel consumption state. Ring indices are 16-bit: a full wrap between samples can alias unchanged indices, so equal values do not prove no work occurred. `--summary-interval` controls summary cadence. The required low-frequency `vhost_net_ioctl` snapshot probe is shared across targets. Observe and recover do not load or attach the traffic-dependent diagnostic stage programs.
 
 ```sh
 sudo podman logs -f vhost-watch
 sudo podman stop --time 10 vhost-watch
 ```
 
-## Opt-in recurring recovery
+Stopping detaches probes and releases process locks. Repeat the start command to restart a container created with `--rm`. Journald retention is controlled by the Host's journal configuration.
 
-`--mode recover` is an experimental policy for repeated lost notifications. Build the current source on the QEMU Host; the example uses the resulting local image:
-
-```sh
-sudo podman build --target agent -f deploy/Containerfile -t localhost/vhost-watch:dev .
-sudo mkdir -p /var/lib/vhost-watch
-sudo podman run --detach --rm --name vhost-watch-recover --privileged --pid=host --network=none --read-only --security-opt label=disable -v /sys/kernel/btf:/sys/kernel/btf:ro -v /var/lib/vhost-watch:/state:rw --log-driver=k8s-file --log-opt=max-size=10mb -v /run/libvirt/qemu:/run/libvirt/qemu:ro localhost/vhost-watch:dev --domain-regex '^worker-' --mode recover
-```
-
-Choose the intended domains or replace the regex with `--pid 1234`. Stop the existing observer for those PIDs before starting this one; all observers should share the same state directory. The default mode remains `observe`.
-
-Recover mode automatically batches user-ring reads and uses `--interval` for both no-progress observation and retry pacing, defaulting to 0.1 seconds. A candidate needs at least two observations with outstanding descriptors and no completion progress, followed by live confirmation of unconsumed descriptors. Every kick refreshes QEMU FD inventory and validates process identity, the pinned vhost attachment, its waiter/backend, and the nonblocking eventfd. There is no incident expiry or hourly quota: retries continue while a candidate persists, including incidents lasting 30 seconds or longer. Attempts and failures are paced from the end of validation; actual retry gaps can exceed 100 ms. Legacy `--threshold`, `--cooldown`, `--max-recoveries`, and `--kick-interval` do not control this mode. It rejects `--trace-stages` and `--once`/`--rescue`.
-
-Healthy queue discovery defaults to `--inventory-interval 5` seconds; existing queues still receive batched reads each polling interval. Set `--inventory-interval 1` explicitly to evaluate more frequent attachment discovery. New or reconfigured attachments can wait for discovery. Unsupported slots retry at the discovery interval; a previously supported attachment gets one prompt rediscovery retry before persistent failures use that interval. Healthy JSON summaries use `source: cached_user_indices`; they do not report cached consumption as fresh kernel state. Unavailable known queues retain their pending verification age and report lost observation coverage. A successful write remains unconfirmed until a later live snapshot shows both consumption and completion progress. `--verify-timeout` only schedules an unconfirmed report; it does not stop retries. Summaries aggregate attempts, writes, refusals, confirmations, and actual polling/attempt gaps. Reporting uses a one-second quiet period without blocking another recovery attempt.
-
-Operate it with the container name, logs, and the same start command:
-
-```sh
-sudo podman logs -f vhost-watch-recover
-sudo podman stop --time 10 vhost-watch-recover
-sudo podman run --rm --name vhost-recovery --privileged --pid=host --network=none --read-only --security-opt label=disable -v /sys/kernel/btf:/sys/kernel/btf:ro -v /var/lib/vhost-watch:/state:rw localhost/vhost-watch:dev --pid 1234 --once
-```
-
-Stopping detaches the agent's probes and releases its observer lock. Because the container uses `--rm`, restart by repeating the detached start command above; domain selection can follow a restarted QEMU process. Manual `--once` uses the existing verified recovery path and runs without `--mode recover`. Use a fresh `--list-queues` result with `--vhost-fd` when restricting manual recovery to one slot.
-
-Sub-500 ms application recovery, a below-one-percent throughput regression, physical dual-25 Gbps ECMP behavior, and uninterrupted BFD/BGP sessions remain qualification targets. Per-queue pacing is implemented; a Host-wide attempt cap and large simultaneous-fault scale have not been qualified. Continuous suppression of every wakeup, including recovery kicks, cannot be bypassed by this mechanism. Queue progress alone does not prove packet delivery or session continuity. Measure healthy traffic and application/session behavior separately before choosing an operating cadence.
-
-## Manual recovery: run once
+### Manual kick
 
 Write one verified kick to every selected TX slot and exit:
 
 ```sh
-sudo podman run --rm --name vhost-recovery --privileged --pid=host --network=none --read-only --security-opt label=disable -v /sys/kernel/btf:/sys/kernel/btf:ro -v /var/lib/vhost-watch:/state:rw -v /run/libvirt/qemu:/run/libvirt/qemu:ro ghcr.io/yckao/virtio-net-recovery:main --domain-regex '^worker-' --once
+sudo podman run --rm --name vhost-kick --privileged --pid=host --network=none --read-only --security-opt label=disable -v /sys/kernel/btf:/sys/kernel/btf:ro -v /var/lib/vhost-watch:/state:rw localhost/vhost-watch:dev --pid 1234 --mode kick
 ```
 
-Restrict manual recovery to one current TX slot in one VM:
+Restrict the write to one current TX slot using a fresh `--list-queues` result:
 
 ```sh
-sudo podman run --rm --name vhost-recovery --privileged --pid=host --network=none --read-only --security-opt label=disable -v /sys/kernel/btf:/sys/kernel/btf:ro -v /var/lib/vhost-watch:/state:rw ghcr.io/yckao/virtio-net-recovery:main --pid 1234 --once --vhost-fd 42
+sudo podman run --rm --name vhost-kick --privileged --pid=host --network=none --read-only --security-opt label=disable -v /sys/kernel/btf:/sys/kernel/btf:ro -v /var/lib/vhost-watch:/state:rw localhost/vhost-watch:dev --pid 1234 --mode kick --vhost-fd 42
 ```
 
-`--once` deliberately bypasses stall detection and the observer lock, so it can run alongside an observing agent. It reports per-target results as JSON and exits nonzero for unavailable targets or failed writes. A successful write is not proof that application traffic recovered.
+Kick retains live identity and eventfd validation, bypasses the observer lock, and can run alongside an observing agent. It reports per-target JSON results and exits nonzero for unavailable targets or failed writes. A successful write alone is not recovery confirmation.
+
+### Bounded diagnostic trace
+
+Trace requires an explicit `--duration` between **1 and 300 seconds**, uses the targets selected at startup, and caps shared JSON stdout at **8 MiB**, stopping before a partial line would be emitted:
+
+```sh
+sudo podman run --rm --name vhost-trace --privileged --pid=host --network=none --read-only --security-opt label=disable -v /sys/kernel/btf:/sys/kernel/btf:ro -v /var/lib/vhost-watch:/state:rw --log-driver=journald localhost/vhost-watch:dev --pid 1234 --mode trace --duration 30
+```
+
+Only trace loads and attaches stage probes for `eventfd_signal_mask`, `eventfd_write`, `vhost_poll_wakeup`, and `handle_tx_kick` entry/return. The diagnostics are aggregate stage counters, not a full guest/KVM event timeline. Missed kretprobe returns can affect the active-handler counter; it is not exact proof of worker idleness. Trace adds traffic-dependent overhead and cannot diagnose lost notification conclusively.
+
+Agent support is limited to Linux amd64, little-endian split rings, matching vhost BTF, and available probe symbols. Fault-module build compatibility with a kernel does not qualify trace on that kernel. Kernel changes, lockdown, BPF/kprobe restrictions or missing module BTF can prevent loading or attaching probes. The agent reports these failures and cleans up its links; it does not load modules or change security settings. Kernel integration and traffic overhead need separate controlled validation from hosted CI.
+
+### Migration from the older CLI
+
+- `--once` and `--rescue` remain aliases for `--mode kick`. An explicitly supplied different mode is rejected.
+- `--trace-stages` remains an alias for `--mode trace`, requiring the same explicit duration. An explicitly supplied different mode is rejected. Combining kick and trace aliases is rejected.
+- `--mode guarded` and `--mode periodic` are rejected with migration guidance. Use `recover` for candidate-based recovery or `kick` for an intentional manual write.
+- `--threshold`, `--cooldown`, `--max-recoveries`, `--kick-interval`, and `--batch-rings` are rejected whenever explicitly supplied, including their old default values. Observe/recover batch known queue reads automatically; `--interval` controls candidate observation and retry pacing.
+
+Sub-500 ms application recovery, below-one-percent throughput regression, physical dual-25 Gbps ECMP behavior, and uninterrupted BFD/BGP sessions remain qualification targets. Large simultaneous faults and a Host-wide attempt cap have not been qualified. Continuous suppression of every wakeup, including recovery kicks, cannot be bypassed by this mechanism. Measure healthy traffic and application/session behavior separately before choosing a cadence.
 
 ## Host fault injection
 
@@ -116,7 +131,7 @@ The controller builds a small kernel module against the Host headers. During the
 
 The default drops one wakeup. For a stronger controlled injection, increase `--drops`, for example to `1000`; the window still bounds the interruption. Delay and window are each limited to 60 seconds. The kernel enforces the window and schedules probe removal independently of the controller. The controller removes the module after the window, then waits for queue progress or the recovery deadline.
 
-3. While the queue remains stalled, trigger `--once --vhost-fd` as shown above and verify traffic resumes.
+3. While the queue remains stalled, trigger `--mode kick --vhost-fd` as shown above and verify traffic resumes.
 4. Stop the injector when finished:
 
 ```sh

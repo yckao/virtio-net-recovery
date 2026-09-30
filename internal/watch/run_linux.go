@@ -11,56 +11,49 @@ import (
 	"math"
 	"os"
 	"path/filepath"
-	"slices"
 	"time"
 
 	"golang.org/x/sys/unix"
 )
 
 type Config struct {
-	PID                                                                                   int
-	Mode, StateDir, BPFObject                                                             string
-	Interval, Threshold, Cooldown, KickInterval, VerifyTimeout, SummaryInterval, Duration float64
-	MaxRecoveries                                                                         int
-	Rescue                                                                                bool
-	VhostFD                                                                               int
-	InventoryInterval                                                                     float64
-	TraceStages                                                                           bool
-	BatchRings                                                                            bool
-	Domain                                                                                string
-	CheckIdentity                                                                         func() error
+	PID                                                                   int
+	Mode, StateDir, BPFObject                                             string
+	Interval, InventoryInterval, VerifyTimeout, SummaryInterval, Duration float64
+	VhostFD                                                               int
+	Domain                                                                string
+	CheckIdentity                                                         func() error
 }
 
 func (c Config) Validate() error {
 	if c.PID <= 0 {
 		return errors.New("PID must be positive")
 	}
-	if c.Mode != "observe" && c.Mode != "guarded" && c.Mode != "periodic" && c.Mode != "recover" {
-		return errors.New("mode must be observe, guarded, periodic, or recover")
+	switch c.Mode {
+	case "observe", "recover", "kick", "trace":
+	case "guarded":
+		return errors.New("guarded mode was removed: use --mode recover for conditional paced recovery, or --mode observe for read-only candidates")
+	case "periodic":
+		return errors.New("periodic mode was removed: use --mode recover for conditional paced recovery; --mode kick performs one explicit manual kick")
+	default:
+		return errors.New("mode must be observe, recover, kick, or trace")
 	}
-	if c.Mode == "recover" && (c.TraceStages || c.Rescue) {
-		return errors.New("recover mode requires stage tracing and rescue to be disabled")
-	}
-	if c.BatchRings && ((c.Mode != "guarded" && c.Mode != "recover") || c.TraceStages || c.Rescue) {
-		return errors.New("batch-rings requires guarded or recover mode without stage tracing or rescue")
-	}
-	intervals := []float64{c.Interval, c.InventoryInterval, c.VerifyTimeout, c.SummaryInterval}
-	if c.Mode != "recover" {
-		intervals = append(intervals, c.Threshold, c.Cooldown, c.KickInterval)
-	}
-	for _, v := range intervals {
+	for _, v := range []float64{c.Interval, c.InventoryInterval, c.VerifyTimeout, c.SummaryInterval} {
 		if math.IsNaN(v) || math.IsInf(v, 0) || v <= 0 || v > float64(math.MaxInt64)/float64(time.Second) {
-			return errors.New("intervals and thresholds must be finite positive seconds")
+			return errors.New("intervals must be finite positive seconds")
 		}
 	}
 	if time.Duration(c.Interval*float64(time.Second)) < time.Nanosecond {
 		return errors.New("snapshot interval is too small")
 	}
-	if math.IsNaN(c.Duration) || math.IsInf(c.Duration, 0) || c.Duration < 0 || (c.Mode != "recover" && c.MaxRecoveries <= 0) {
-		return errors.New("duration must be finite and nonnegative; recovery budget must be positive")
+	if math.IsNaN(c.Duration) || math.IsInf(c.Duration, 0) || c.Duration < 0 || c.Duration > float64(math.MaxInt64)/float64(time.Second) {
+		return errors.New("duration must be finite nonnegative seconds within the timer range")
 	}
-	if c.VhostFD < -1 || c.VhostFD >= 0 && !c.Rescue {
-		return errors.New("vhost-fd is only valid with rescue")
+	if c.Mode == "trace" && (c.Duration < 1 || c.Duration > 300) {
+		return errors.New("trace requires --duration in 1..300 seconds")
+	}
+	if c.VhostFD < -1 || c.VhostFD >= 0 && c.Mode != "kick" {
+		return errors.New("vhost-fd is only valid with --mode kick")
 	}
 	if c.StateDir == "" || c.BPFObject == "" {
 		return errors.New("state directory and BPF object must be specified")
@@ -96,25 +89,17 @@ func (l *logger) emit(event string, fields map[string]any) {
 	}
 	l.err = l.encoder.Encode(fields)
 }
+
 func fields(row QueueRow) map[string]any {
 	return map[string]any{"vhost_fd": row.VhostFD, "eventfd_id": row.EventID, "num": row.Num,
 		"avail": row.Avail, "used": row.Used, "consumed": row.Consumed, "pending": row.Pending,
-		"outstanding": row.Outstanding, "stalled": row.Stalled, "busy": row.Busy, "stages": row.Stages}
+		"outstanding": row.Outstanding, "stalled": row.Stalled, "work_queued": row.WorkQueued, "busy": row.WorkQueued, "stages": row.Stages}
 }
 
-type verification struct {
-	at             float64
-	used, consumed uint16
-	stalled        bool
-}
+// Run owns descriptors and BPF resources until cancellation or QEMU exit.
+func Run(ctx context.Context, c Config, output io.Writer) error { return run(ctx, c, output, nil) }
 
-// Run owns all descriptors and BPF resources until cancellation or QEMU exit.
-func Run(ctx context.Context, c Config, output io.Writer) error {
-	return run(ctx, c, output, nil)
-}
-
-// RunWithBPF shares one serialized snapshot channel between independent VMs.
-// The caller closes shared only after every target worker has exited.
+// RunWithBPF uses the manager's serialized snapshot channel and output bounds.
 func RunWithBPF(ctx context.Context, c Config, output io.Writer, shared *BPF) error {
 	if shared == nil {
 		return errors.New("shared BPF is required")
@@ -126,13 +111,17 @@ func run(ctx context.Context, c Config, output io.Writer, shared *BPF) error {
 	if err := c.Validate(); err != nil {
 		return err
 	}
-	var lock *os.File
-	if !c.Rescue {
+	if c.Mode == "trace" && shared == nil {
+		child, cancel := context.WithTimeout(ctx, time.Duration(c.Duration*float64(time.Second)))
+		defer cancel()
+		ctx = child
+		output = newTraceWriter(output, cancel)
+	}
+	if c.Mode == "observe" || c.Mode == "recover" {
 		if err := os.MkdirAll(c.StateDir, 0700); err != nil {
 			return err
 		}
-		var err error
-		lock, err = os.OpenFile(filepath.Join(c.StateDir, fmt.Sprintf("%d.lock", c.PID)), os.O_CREATE|os.O_WRONLY, 0600)
+		lock, err := os.OpenFile(filepath.Join(c.StateDir, fmt.Sprintf("%d.lock", c.PID)), os.O_CREATE|os.O_WRONLY, 0600)
 		if err != nil {
 			return err
 		}
@@ -153,227 +142,49 @@ func run(ctx context.Context, c Config, output io.Writer, shared *BPF) error {
 	}
 	bpf := shared
 	if bpf == nil {
-		bpf, err = OpenBPF(c.BPFObject, c.TraceStages)
+		bpf, err = OpenBPF(c.BPFObject, c.Mode == "trace")
 		if err != nil {
-			return err
+			return fmt.Errorf("%s: %w", c.Mode, err)
 		}
 		defer bpf.Close()
 	}
 	l := &logger{encoder: json.NewEncoder(output), pid: c.PID, domain: c.Domain}
-	if c.Rescue {
-		return rescue(target, bpf, c.VhostFD, l)
+	if c.Mode == "kick" {
+		return kick(ctx, c, target, bpf, l)
 	}
 	var uts unix.Utsname
 	_ = unix.Uname(&uts)
-	startedFields := map[string]any{"implementation": "go", "mode": c.Mode, "kernel": unix.ByteSliceToString(uts.Release[:]),
-		"interval": c.Interval, "kick_interval": c.KickInterval, "threshold": c.Threshold,
-		"inventory_interval": c.InventoryInterval, "trace_stages": c.TraceStages, "batch_rings": c.BatchRings}
-	if c.Mode == "recover" {
-		startedFields["batch_rings"] = true
-		startedFields["threshold"], startedFields["kick_interval"] = c.Interval, c.Interval
-		startedFields["recovery_budget"] = "paced_unlimited"
+	l.emit("started", map[string]any{"implementation": "go", "mode": c.Mode, "kernel": unix.ByteSliceToString(uts.Release[:]),
+		"interval": c.Interval, "inventory_interval": c.InventoryInterval, "trace_stages": c.Mode == "trace", "batch_rings": c.Mode != "trace"})
+	if l.err != nil {
+		return l.err
 	}
-	l.emit("started", startedFields)
-	if c.Mode == "recover" {
-		return runRecover(ctx, c, target, bpf, l)
+	if c.Mode == "trace" {
+		return runTrace(ctx, c, target, bpf, l)
 	}
-	if c.BatchRings {
-		return runBatched(ctx, c, target, bpf, l)
-	}
-	started, lastSummary := monotonic(), math.Inf(-1)
-	lastInventory := math.Inf(-1)
-	var vhosts []int
-	var events map[uint32][]int
-	states := map[int]*Detector{}
-	snapshots := map[int]Snapshot{}
-	pending := map[int]verification{}
-	rows := []QueueRow{}
-	totalWrites := uint64(0)
-	defer func() { l.emit("stopped", map[string]any{"writes": totalWrites, "queues": rows}) }()
-	ticker := time.NewTicker(time.Duration(c.Interval * float64(time.Second)))
-	defer ticker.Stop()
-	for {
-		if ctx.Err() != nil {
-			return l.err
-		}
-		alive, err := target.CheckAlive()
-		if err != nil {
-			return fmt.Errorf("check QEMU pidfd: %w", err)
-		}
-		if !alive {
-			l.emit("target_exited", map[string]any{})
-			return l.err
-		}
-		now := monotonic()
-		if c.Duration > 0 && now-started >= c.Duration {
-			return l.err
-		}
-		// Cache only discovery results. Each queue still gets a fresh pidfd_getfd
-		// and live BPF snapshot on every tick; no kernel pointers are trusted from
-		// the discovery cache. Recovery always refreshes and revalidates below.
-		if now-lastInventory >= c.InventoryInterval {
-			vhosts, events, err = target.Inventory()
-			if err != nil {
-				return err
-			}
-			lastInventory = now
-		}
-		rows = []QueueRow{}
-		seen := map[int]bool{}
-		for _, remoteFD := range vhosts {
-			seen[remoteFD] = true
-			row, err := func() (QueueRow, error) {
-				fd, err := target.Duplicate(remoteFD)
-				if err != nil {
-					return QueueRow{}, err
-				}
-				defer unix.Close(fd)
-				s, err := bpf.Snapshot(fd)
-				if err != nil {
-					return QueueRow{}, err
-				}
-				if old, ok := snapshots[remoteFD]; ok && old.Identity() != s.Identity() {
-					bpf.Forget(old)
-					delete(pending, remoteFD)
-					s, err = bpf.Snapshot(fd)
-					if err != nil {
-						return QueueRow{}, err
-					}
-				}
-				snapshots[remoteFD] = s
-				d := states[remoteFD]
-				if d == nil {
-					d = NewDetector(c.Threshold, c.Cooldown, c.MaxRecoveries)
-					states[remoteFD] = d
-				}
-				avail, used, err := target.Ring(s)
-				if err != nil {
-					return QueueRow{}, err
-				}
-				counters, err := bpf.Counters(s.VQ)
-				if err != nil {
-					return QueueRow{}, err
-				}
-				// VHOST_WORK_QUEUED is bit index 1. Counter timestamps use CLOCK_MONOTONIC.
-				busy := s.WorkFlags&(1<<1) != 0 || counters.Active != 0 || now-float64(counters.LastHandlerNS)/1e9 < c.Interval
-				stalled := d.Observe(s, avail, used, busy, now)
-				row := QueueRow{VhostFD: remoteFD, EventID: s.EventID, Num: s.Num, Avail: avail, Used: used, Consumed: s.LastAvail,
-					Pending: avail - s.LastAvail, Outstanding: avail - used, Stalled: stalled, Busy: busy, Stages: counters}
-				if v, ok := pending[remoteFD]; ok {
-					if used != v.used && s.LastAvail != v.consumed {
-						event := "progress_after_kick"
-						if v.stalled {
-							event = "recovered"
-						}
-						f := fields(row)
-						f["latency"] = now - v.at
-						l.emit(event, f)
-						delete(pending, remoteFD)
-					} else if now-v.at >= c.VerifyTimeout {
-						l.emit("recovery_unconfirmed", fields(row))
-						delete(pending, remoteFD)
-					}
-				}
-				if stalled && !d.Reported {
-					f := fields(row)
-					f["age"] = now - d.Since
-					l.emit("stall", f)
-					d.Reported = true
-				}
-				if l.err != nil {
-					return QueueRow{}, l.err
-				}
-				periodic := c.Mode == "periodic" && now-d.LastKick >= c.KickInterval
-				guarded := c.Mode == "guarded" && stalled && d.Allowed(now)
-				if (periodic || guarded) && ctx.Err() == nil {
-					if guarded {
-						// A rare guarded recovery must not depend on stale discovery.
-						current, refreshed, err := target.Inventory()
-						if err != nil {
-							return QueueRow{}, err
-						}
-						if !slices.Contains(current, remoteFD) {
-							return QueueRow{}, errors.New("vhost FD disappeared before recovery")
-						}
-						events = refreshed
-					}
-					// Re-duplicate even though fd is pinned above: QEMU may have
-					// replaced that descriptor during discovery. Rekick compares the
-					// fresh attachment against s before writing the pinned eventfd.
-					currentFD, err := target.Duplicate(remoteFD)
-					if err != nil {
-						return QueueRow{}, err
-					}
-					err = Rekick(target, bpf, currentFD, s, events)
-					unix.Close(currentFD)
-					if err != nil {
-						return QueueRow{}, err
-					}
-					d.LastKick = now
-					if guarded {
-						d.Kicked(now)
-					}
-					totalWrites++
-					f := fields(row)
-					f["reason"] = "stall"
-					if periodic {
-						f["reason"] = "periodic"
-					}
-					l.emit("rekick", f)
-					if _, ok := pending[remoteFD]; row.Pending > 0 && !ok {
-						pending[remoteFD] = verification{now, used, s.LastAvail, guarded || stalled}
-					}
-				}
-				return row, nil
-			}()
-			if err != nil {
-				lastInventory = math.Inf(-1)
-				l.emit("queue_unavailable", map[string]any{"vhost_fd": remoteFD, "error": err.Error()})
-				if d := states[remoteFD]; d != nil {
-					d.Since = now
-					d.Reported = false
-				}
-				delete(pending, remoteFD)
-			} else {
-				rows = append(rows, row)
-			}
-			if l.err != nil {
-				return l.err
-			}
-		}
-		for fd, s := range snapshots {
-			if !seen[fd] {
-				bpf.Forget(s)
-				delete(snapshots, fd)
-				delete(pending, fd)
-			}
-		}
-		if now-lastSummary >= c.SummaryInterval {
-			l.emit("sample", map[string]any{"writes": totalWrites, "queues": rows})
-			lastSummary = now
-		}
-		if l.err != nil {
-			return l.err
-		}
-		select {
-		case <-ctx.Done():
-			return l.err
-		case <-ticker.C:
-		}
-	}
+	return runRecover(ctx, c, target, bpf, l)
 }
 
-func rescue(target *Target, bpf *BPF, only int, l *logger) error {
+// kick is the manual, one-shot entry point to the same verified write primitive.
+func kick(ctx context.Context, c Config, target *Target, bpf *BPF, l *logger) error {
 	vhosts, events, err := target.Inventory()
 	if err != nil {
 		return err
 	}
 	written := false
 	for _, remoteFD := range vhosts {
-		if only >= 0 && only != remoteFD {
+		if c.VhostFD >= 0 && c.VhostFD != remoteFD {
 			continue
 		}
 		err = func() error {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			if c.CheckIdentity != nil {
+				if err := c.CheckIdentity(); err != nil {
+					return err
+				}
+			}
 			fd, err := target.Duplicate(remoteFD)
 			if err != nil {
 				return err
@@ -383,10 +194,10 @@ func rescue(target *Target, bpf *BPF, only int, l *logger) error {
 			if err != nil {
 				return err
 			}
-			if err = Rekick(target, bpf, fd, s, events); err != nil {
+			if err := RekickContext(ctx, target, bpf, fd, s, events); err != nil {
 				return err
 			}
-			l.emit("rescue_kick", map[string]any{"vhost_fd": remoteFD, "eventfd_id": s.EventID, "implementation": "go"})
+			l.emit("kick_written", map[string]any{"vhost_fd": remoteFD, "eventfd_id": s.EventID, "implementation": "go", "progress": "unmeasured"})
 			return l.err
 		}()
 		if err != nil {

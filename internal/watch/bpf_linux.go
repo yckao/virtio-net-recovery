@@ -31,9 +31,10 @@ func OpenBPF(path string, traceStages bool) (_ *BPF, err error) {
 	if err != nil {
 		return nil, err
 	}
+	selectBPFPrograms(spec, traceStages)
 	collection, err := ebpf.NewCollection(spec)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("load BPF programs (trace=%t): %w", traceStages, err)
 	}
 	b := &BPF{collection: collection, traceStages: traceStages}
 	defer func() {
@@ -73,7 +74,7 @@ func OpenBPF(path string, traceStages bool) (_ *BPF, err error) {
 			attached, err = link.Kprobe(probe.symbol, program, nil)
 		}
 		if err != nil {
-			return nil, fmt.Errorf("attach %s: %w", probe.name, err)
+			return nil, fmt.Errorf("attach %s on %s (trace=%t): %w", probe.name, probe.symbol, traceStages, err)
 		}
 		b.links = append(b.links, attached)
 	}
@@ -132,5 +133,16 @@ func (b *BPF) Counters(vq uint64) (Counters, error) {
 func (b *BPF) Forget(s Snapshot) {
 	for name, key := range map[string]uint64{"stats": s.VQ, "contexts": s.Context, "works": s.Work, "waits": s.Wait} {
 		_ = b.collection.Maps[name].Delete(key)
+	}
+}
+
+// Stage programs are not even loaded/verified outside trace mode.
+func selectBPFPrograms(spec *ebpf.CollectionSpec, traceStages bool) {
+	if !traceStages {
+		for name := range spec.Programs {
+			if name != "snapshot_tx" {
+				delete(spec.Programs, name)
+			}
+		}
 	}
 }

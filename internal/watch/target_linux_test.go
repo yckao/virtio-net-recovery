@@ -69,6 +69,60 @@ func TestRekickCancellationAfterLiveSnapshotRefusesWrite(t *testing.T) {
 
 func (b testBPF) Snapshot(int) (Snapshot, error) { return b.value, b.err }
 
+type manualWriteSnapshotter struct {
+	value Snapshot
+	calls int
+}
+
+func (b *manualWriteSnapshotter) Snapshot(int) (Snapshot, error) {
+	b.calls++
+	return b.value, nil
+}
+
+func TestManualWriteAcceptsEmptyRingAndQueuedWork(t *testing.T) {
+	for _, queued := range []bool{false, true} {
+		name := "empty_ring"
+		if queued {
+			name = "empty_ring_with_queued_work"
+		}
+		t.Run(name, func(t *testing.T) {
+			fd, err := unix.Eventfd(0, unix.EFD_CLOEXEC|unix.EFD_NONBLOCK)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer unix.Close(fd)
+			id, err := eventID("self", fd)
+			if err != nil {
+				t.Fatal(err)
+			}
+			// Manual recovery verifies the attachment, without requiring pending
+			// descriptors or interpreting the queued bit as worker idleness.
+			avail, used := [4]byte{0, 0, 10, 0}, [4]byte{0, 0, 10, 0}
+			s := configured()
+			s.EventID, s.LastAvail, s.LastUsed = id, 10, 10
+			s.Avail = uint64(uintptr(unsafe.Pointer(&avail[0])))
+			s.Used = uint64(uintptr(unsafe.Pointer(&used[0])))
+			if queued {
+				s.WorkFlags = 1 << 1
+			}
+			target := &testTarget{source: fd, alive: true}
+			bpf := &manualWriteSnapshotter{value: s}
+			if err := RekickContext(context.Background(), target, bpf, 33, s, map[uint32][]int{id: {66}}); err != nil {
+				t.Fatal(err)
+			}
+			runtime.KeepAlive(&avail)
+			runtime.KeepAlive(&used)
+			if bpf.calls != 1 {
+				t.Fatalf("manual write performed %d snapshots; want only the final pre-write identity check", bpf.calls)
+			}
+			var data [8]byte
+			if n, err := unix.Read(fd, data[:]); err != nil || n != 8 || binary.NativeEndian.Uint64(data[:]) != 1 {
+				t.Fatalf("manual recovery did not write exactly one native-u64 kick: %d %v %v", n, data, err)
+			}
+		})
+	}
+}
+
 func TestVerifiedRekickAndRefusals(t *testing.T) {
 	for _, name := range []string{"valid", "fd_reused", "queue_reconfigured", "process_exited", "blocking", "missing", "snapshot_error", "detached_waiter"} {
 		t.Run(name, func(t *testing.T) {
@@ -219,7 +273,7 @@ func TestBatchedRingReadAndPartialFailure(t *testing.T) {
 }
 
 func TestConfigRejectsUnboundedOrInvalidValues(t *testing.T) {
-	c := Config{PID: 1, Mode: "observe", StateDir: "/state", BPFObject: "/watch.bpf.o", Interval: 0.25, InventoryInterval: 1, Threshold: 3, Cooldown: 30, KickInterval: 1, VerifyTimeout: 5, SummaryInterval: 1, MaxRecoveries: 3, VhostFD: -1}
+	c := Config{PID: 1, Mode: "observe", StateDir: "/state", BPFObject: "/watch.bpf.o", Interval: 0.25, InventoryInterval: 1, VerifyTimeout: 5, SummaryInterval: 1, VhostFD: -1}
 	if err := c.Validate(); err != nil {
 		t.Fatal(err)
 	}
@@ -237,18 +291,35 @@ func TestConfigRejectsUnboundedOrInvalidValues(t *testing.T) {
 	}
 }
 
-func TestRecoverConfigUsesCadenceWithoutLegacyBudgetAndRefusesHotPathTracing(t *testing.T) {
+func TestFourModesAndTraceBounds(t *testing.T) {
 	c := Config{PID: 1, Mode: "recover", StateDir: "/state", BPFObject: "/watch.bpf.o", Interval: .1, InventoryInterval: 5, VerifyTimeout: 5, SummaryInterval: 5, VhostFD: -1}
+	for _, mode := range []string{"observe", "recover", "kick", "trace"} {
+		c.Mode, c.Duration = mode, 30
+		if err := c.Validate(); err != nil {
+			t.Fatalf("%s: %v", mode, err)
+		}
+	}
+	for _, value := range []float64{0, .5, 301, math.NaN(), math.Inf(1)} {
+		c.Duration = value
+		if c.Validate() == nil {
+			t.Fatalf("trace accepted duration %v", value)
+		}
+	}
+	c.Mode, c.Duration = "recover", 0
+	c.VhostFD = 42
+	if c.Validate() == nil {
+		t.Fatal("recover allowed a manual-kick FD selector")
+	}
+	c.Mode = "kick"
 	if err := c.Validate(); err != nil {
-		t.Fatalf("recover required unused legacy thresholds or budget: %v", err)
+		t.Fatal(err)
 	}
-	c.TraceStages = true
-	if c.Validate() == nil {
-		t.Fatal("recover allowed traffic-dependent stage probes")
-	}
-	c.TraceStages, c.Rescue = false, true
-	if c.Validate() == nil {
-		t.Fatal("recover allowed observer-lock bypass through rescue")
+	c.VhostFD = -1
+	for _, mode := range []string{"guarded", "periodic", "unknown"} {
+		c.Mode = mode
+		if c.Validate() == nil {
+			t.Fatalf("accepted removed mode %s", mode)
+		}
 	}
 }
 
