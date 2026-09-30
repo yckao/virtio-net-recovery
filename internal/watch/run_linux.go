@@ -35,13 +35,20 @@ func (c Config) Validate() error {
 	if c.PID <= 0 {
 		return errors.New("PID must be positive")
 	}
-	if c.Mode != "observe" && c.Mode != "guarded" && c.Mode != "periodic" {
-		return errors.New("mode must be observe, guarded, or periodic")
+	if c.Mode != "observe" && c.Mode != "guarded" && c.Mode != "periodic" && c.Mode != "recover" {
+		return errors.New("mode must be observe, guarded, periodic, or recover")
 	}
-	if c.BatchRings && (c.Mode != "guarded" || c.TraceStages || c.Rescue) {
-		return errors.New("batch-rings requires guarded mode without stage tracing or rescue")
+	if c.Mode == "recover" && (c.TraceStages || c.Rescue) {
+		return errors.New("recover mode requires stage tracing and rescue to be disabled")
 	}
-	for _, v := range []float64{c.Interval, c.InventoryInterval, c.Threshold, c.Cooldown, c.KickInterval, c.VerifyTimeout, c.SummaryInterval} {
+	if c.BatchRings && ((c.Mode != "guarded" && c.Mode != "recover") || c.TraceStages || c.Rescue) {
+		return errors.New("batch-rings requires guarded or recover mode without stage tracing or rescue")
+	}
+	intervals := []float64{c.Interval, c.InventoryInterval, c.VerifyTimeout, c.SummaryInterval}
+	if c.Mode != "recover" {
+		intervals = append(intervals, c.Threshold, c.Cooldown, c.KickInterval)
+	}
+	for _, v := range intervals {
 		if math.IsNaN(v) || math.IsInf(v, 0) || v <= 0 || v > float64(math.MaxInt64)/float64(time.Second) {
 			return errors.New("intervals and thresholds must be finite positive seconds")
 		}
@@ -49,7 +56,7 @@ func (c Config) Validate() error {
 	if time.Duration(c.Interval*float64(time.Second)) < time.Nanosecond {
 		return errors.New("snapshot interval is too small")
 	}
-	if math.IsNaN(c.Duration) || math.IsInf(c.Duration, 0) || c.Duration < 0 || c.MaxRecoveries <= 0 {
+	if math.IsNaN(c.Duration) || math.IsInf(c.Duration, 0) || c.Duration < 0 || (c.Mode != "recover" && c.MaxRecoveries <= 0) {
 		return errors.New("duration must be finite and nonnegative; recovery budget must be positive")
 	}
 	if c.VhostFD < -1 || c.VhostFD >= 0 && !c.Rescue {
@@ -158,9 +165,18 @@ func run(ctx context.Context, c Config, output io.Writer, shared *BPF) error {
 	}
 	var uts unix.Utsname
 	_ = unix.Uname(&uts)
-	l.emit("started", map[string]any{"implementation": "go", "mode": c.Mode, "kernel": unix.ByteSliceToString(uts.Release[:]),
+	startedFields := map[string]any{"implementation": "go", "mode": c.Mode, "kernel": unix.ByteSliceToString(uts.Release[:]),
 		"interval": c.Interval, "kick_interval": c.KickInterval, "threshold": c.Threshold,
-		"inventory_interval": c.InventoryInterval, "trace_stages": c.TraceStages, "batch_rings": c.BatchRings})
+		"inventory_interval": c.InventoryInterval, "trace_stages": c.TraceStages, "batch_rings": c.BatchRings}
+	if c.Mode == "recover" {
+		startedFields["batch_rings"] = true
+		startedFields["threshold"], startedFields["kick_interval"] = c.Interval, c.Interval
+		startedFields["recovery_budget"] = "paced_unlimited"
+	}
+	l.emit("started", startedFields)
+	if c.Mode == "recover" {
+		return runRecover(ctx, c, target, bpf, l)
+	}
 	if c.BatchRings {
 		return runBatched(ctx, c, target, bpf, l)
 	}

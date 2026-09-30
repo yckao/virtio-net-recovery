@@ -3,6 +3,7 @@
 package watch
 
 import (
+	"context"
 	"encoding/binary"
 	"errors"
 	"math"
@@ -30,6 +31,40 @@ func (t *testTarget) Duplicate(fd int) (int, error) {
 type testBPF struct {
 	value Snapshot
 	err   error
+}
+
+type cancellingBPF struct {
+	value  Snapshot
+	cancel context.CancelFunc
+}
+
+func (b cancellingBPF) Snapshot(int) (Snapshot, error) {
+	b.cancel()
+	return b.value, nil
+}
+
+func TestRekickCancellationAfterLiveSnapshotRefusesWrite(t *testing.T) {
+	fd, err := unix.Eventfd(0, unix.EFD_CLOEXEC|unix.EFD_NONBLOCK)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer unix.Close(fd)
+	id, err := eventID("self", fd)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := configured()
+	s.EventID = id
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	target := &testTarget{source: fd, duplicate: -1, alive: true}
+	err = RekickContext(ctx, target, cancellingBPF{value: s, cancel: cancel}, 33, s, map[uint32][]int{id: {66}})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("wrong cancellation result: %v", err)
+	}
+	if n, err := unix.Poll([]unix.PollFd{{Fd: int32(fd), Events: unix.POLLIN}}, 0); err != nil || n != 0 {
+		t.Fatal("cancelled recovery wrote to eventfd")
+	}
 }
 
 func (b testBPF) Snapshot(int) (Snapshot, error) { return b.value, b.err }
@@ -199,6 +234,21 @@ func TestConfigRejectsUnboundedOrInvalidValues(t *testing.T) {
 	bad.VhostFD = 39
 	if bad.Validate() == nil {
 		t.Fatal("accepted a rescue-only option for the observer")
+	}
+}
+
+func TestRecoverConfigUsesCadenceWithoutLegacyBudgetAndRefusesHotPathTracing(t *testing.T) {
+	c := Config{PID: 1, Mode: "recover", StateDir: "/state", BPFObject: "/watch.bpf.o", Interval: .1, InventoryInterval: 5, VerifyTimeout: 5, SummaryInterval: 5, VhostFD: -1}
+	if err := c.Validate(); err != nil {
+		t.Fatalf("recover required unused legacy thresholds or budget: %v", err)
+	}
+	c.TraceStages = true
+	if c.Validate() == nil {
+		t.Fatal("recover allowed traffic-dependent stage probes")
+	}
+	c.TraceStages, c.Rescue = false, true
+	if c.Validate() == nil {
+		t.Fatal("recover allowed observer-lock bypass through rescue")
 	}
 }
 
