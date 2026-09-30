@@ -146,6 +146,52 @@ func TestDisappearingSlotsDoNotAccumulatePoliciesOrResetActivePacing(t *testing.
 	}
 }
 
+func TestRecoveryProgressTotalsSurvivePolicyPruningAndNewSlots(t *testing.T) {
+	var totals recoveryProgressTotals
+	p := NewRecoveryPolicy(.1)
+	policies := map[int]*RecoveryPolicy{7: p}
+	beforeWrites, beforeConfirmed := p.Writes, p.Confirmed
+	p.Written(1, 10, 11)
+	p.Written(1.2, 10, 11)
+	totals.add(p, beforeWrites, beforeConfirmed)
+	beforeWrites, beforeConfirmed = p.Writes, p.Confirmed
+	if _, ok := p.Verify(1.3, 11, 12); !ok {
+		t.Fatal("later live progress did not confirm the first slot")
+	}
+	totals.add(p, beforeWrites, beforeConfirmed)
+	pruneRecoveryPolicies(policies, nil)
+	if len(policies) != 0 || totals.writes != 2 || totals.confirmed != 1 {
+		t.Fatalf("pruning lost lifetime progress totals: %+v", totals)
+	}
+
+	p = NewRecoveryPolicy(.1)
+	policies[8] = p
+	beforeWrites, beforeConfirmed = p.Writes, p.Confirmed
+	p.Written(2, 20, 21)
+	if _, ok := p.Verify(2.1, 20, 22); ok {
+		t.Fatal("consumption alone confirmed the new slot")
+	}
+	totals.add(p, beforeWrites, beforeConfirmed)
+	if totals.writes != 3 || totals.confirmed != 1 {
+		t.Fatalf("partial progress changed lifetime confirmations: %+v", totals)
+	}
+	beforeWrites, beforeConfirmed = p.Writes, p.Confirmed
+	if _, ok := p.Verify(2.2, 21, 22); !ok {
+		t.Fatal("later live progress did not confirm the new slot")
+	}
+	totals.add(p, beforeWrites, beforeConfirmed)
+	if totals.writes != 3 || totals.confirmed != 2 {
+		t.Fatalf("new slot replaced lifetime progress totals: %+v", totals)
+	}
+	beforeWrites, beforeConfirmed = p.Writes, p.Confirmed
+	p.Verify(2.3, 22, 23)
+	totals.add(p, beforeWrites, beforeConfirmed)
+	pruneRecoveryPolicies(policies, nil)
+	if totals.writes != 3 || totals.confirmed != 2 {
+		t.Fatalf("verification without a pending write duplicated confirmations: %+v", totals)
+	}
+}
+
 func TestCoverageIncludesUnsupportedSlotsWithoutDoubleCountingKnownFailures(t *testing.T) {
 	failures := map[int]string{8: "temporarily unavailable", 9: "unsupported ring"}
 	fds := unavailableRecoveryFDs([]int{7, 8}, []int{7}, failures)

@@ -25,6 +25,15 @@ type recoveryVerification struct {
 	unconfirmed    bool
 }
 
+// recoveryProgressTotals retains accepted writes and confirmations after queue
+// policies are pruned. Each live check contributes only its new counter values.
+type recoveryProgressTotals struct{ writes, confirmed uint64 }
+
+func (t *recoveryProgressTotals) add(p *RecoveryPolicy, beforeWrites, beforeConfirmed uint64) {
+	t.writes += p.Writes - beforeWrites
+	t.confirmed += p.Confirmed - beforeConfirmed
+}
+
 func NewRecoveryPolicy(cadence float64) *RecoveryPolicy {
 	return &RecoveryPolicy{Cadence: cadence, LastAttempt: math.Inf(-1), LastAttemptStarted: math.Inf(-1)}
 }

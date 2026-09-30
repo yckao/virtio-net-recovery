@@ -43,7 +43,8 @@ func runRecover(ctx context.Context, c Config, target *Target, bpf *BPF, l *logg
 	known := map[int]*recoveryQueue{}
 	policies := map[int]*RecoveryPolicy{}
 	var batch *RingBatch
-	var attempts, writes, refusals, pollErrors uint64
+	var attempts, refusals, pollErrors uint64
+	var progress recoveryProgressTotals
 	forceInventory := true
 	lastInventoryError := ""
 	discoveryFailures := map[int]string{}
@@ -73,7 +74,7 @@ func runRecover(ctx context.Context, c Config, target *Target, bpf *BPF, l *logg
 					"error": discoveryFailures[fd], "previously_supported": false})
 			}
 		}
-		return map[string]any{"attempts": attempts, "writes": writes, "refusals": refusals,
+		return map[string]any{"attempts": attempts, "writes": progress.writes, "refusals": refusals, "confirmed": progress.confirmed,
 			"poll_errors": pollErrors, "max_poll_gap": max(maxPollGap, now-lastPoll), "max_loop_gap": maxLoopGap,
 			"queues": rows, "unavailable_queues": len(unavailable), "source": "cached_user_indices"}
 	}
@@ -220,13 +221,13 @@ func runRecover(ctx context.Context, c Config, target *Target, bpf *BPF, l *logg
 							if attempt {
 								attempts++
 							}
-							before := q.policy.Writes
+							beforeWrites, beforeConfirmed := q.policy.Writes, q.policy.Confirmed
 							err := recoverLive(ctx, c, target, bpf, l, q, attempt)
 							q.lastLive = monotonic()
 							if attempt {
 								q.policy.FinishAttempt(q.lastLive)
 							}
-							writes += q.policy.Writes - before
+							progress.add(q.policy, beforeWrites, beforeConfirmed)
 							if err != nil {
 								if ctx.Err() != nil {
 									return l.err
