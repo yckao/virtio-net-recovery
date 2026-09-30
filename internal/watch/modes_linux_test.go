@@ -50,6 +50,9 @@ func TestObserveDoesNotWriteWhileRecoverUsesSameLiveCandidate(t *testing.T) {
 			if (q.policy.Writes > 0) != (mode == "recover") {
 				t.Fatal("write accounting conflated observe and recover")
 			}
+			if q.lastDecision != EpisodeReasonUnconsumed || q.summary(monotonic())["last_decision"] != EpisodeReasonUnconsumed {
+				t.Fatal("successful live confirmation lost its unconsumed decision")
+			}
 		})
 	}
 }
