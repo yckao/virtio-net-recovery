@@ -189,7 +189,6 @@ func runRecover(ctx context.Context, c Config, target *Target, bpf *BPF, l *logg
 				}
 				// All old queues are either transferred into known or forgotten.
 				pendingCleanup = nil
-				pruneRecoveryPolicies(policies, vhosts)
 				for fd := range discoveryFailures {
 					if !slices.Contains(vhosts, fd) {
 						delete(discoveryFailures, fd)
