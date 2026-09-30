@@ -195,20 +195,54 @@ func TestRecoveryJournalVerificationRetainsOriginAcrossTimeoutAndRetry(t *testin
 }
 
 func TestRecoveryJournalFreshWriteOpensDuringDiagnosticReopenDelay(t *testing.T) {
-	q, target, clock, l, _, _ := recoveryJournalFixture(t)
-	oldID := q.journal.EventID()
-	q.closeEpisode(EpisodeOutcomeQuiet)
-	*clock = .1
-	q.observeCached(l, *clock, true)
-	if q.journal.Active() {
-		t.Fatal("ordinary candidate bypassed reopen hysteresis")
-	}
-	q.policy.Attempt(*clock)
-	if err := recoverLive(context.Background(), Config{Mode: "recover"}, target, testBPF{value: q.snapshot}, l, q, true); err != nil {
-		t.Fatal(err)
-	}
-	if !q.journal.Active() || q.verificationEventID == "" || q.verificationEventID == oldID || q.verificationEventID != q.journal.EventID() {
-		t.Fatal("a new verification borrowed a closed origin or lost its write ID")
+	for _, reopenDelay := range []bool{false, true} {
+		name := "active_episode"
+		if reopenDelay {
+			name = "reopen_delay"
+		}
+		t.Run(name, func(t *testing.T) {
+			q, target, clock, l, output, fd := recoveryJournalFixture(t)
+			oldID := q.journal.EventID()
+			if reopenDelay {
+				q.closeEpisode(EpisodeOutcomeQuiet)
+			}
+			*clock = .1
+			q.observeCached(l, *clock, true)
+			if q.journal.Active() == reopenDelay {
+				t.Fatal("ordinary candidate changed the episode's reopen eligibility")
+			}
+			if !q.policy.Attempt(*clock) {
+				t.Fatal("first recovery was not eligible")
+			}
+			if err := recoverLive(context.Background(), Config{Mode: "recover"}, target, testBPF{value: q.snapshot}, l, q, true); err != nil {
+				t.Fatal(err)
+			}
+			id := q.journal.EventID()
+			if !q.journal.Active() || id == "" || q.verificationEventID != id || (id == oldID) == reopenDelay {
+				t.Fatal("a new verification borrowed a closed origin or replaced an active origin")
+			}
+			summary := q.summary(*clock)
+			if summary["event_id"] != id || summary["verification_event_id"] != id || summary["last_decision"] != EpisodeReasonUnconsumed || summary["writes"] != uint64(1) {
+				t.Fatalf("first-write summary lost its live decision or origin: %+v", summary)
+			}
+			writes := 0
+			for _, r := range recoveryJournalRecords(t, output) {
+				if r["event"] != "episode_write" {
+					continue
+				}
+				writes++
+				if r["event_id"] != id || r["decision"] != string(EpisodeReasonUnconsumed) || r["last_write_reason"] != string(EpisodeReasonUnconsumed) || r["last_write"] != string(EpisodeWriteSuccess) || r["write_accepted"] != true || r["write_successes"] != float64(1) || r["write_errors"] != float64(0) || r["write_refusals"] != float64(0) {
+					t.Fatalf("first-write JSON lost its live decision or accepted write: %+v", r)
+				}
+			}
+			if writes != 1 {
+				t.Fatalf("expected one first-write record, got %d", writes)
+			}
+			var data [8]byte
+			if n, err := unix.Read(fd, data[:]); err != nil || n != 8 || binary.NativeEndian.Uint64(data[:]) != 1 {
+				t.Fatal("the first accepted eventfd write was not observed")
+			}
+		})
 	}
 }
 
