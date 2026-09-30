@@ -38,13 +38,14 @@ func parseConfig(args []string) (watch.ManagerConfig, error) {
 	fs := flag.NewFlagSet("vhost-watch", flag.ContinueOnError)
 	var c watch.Config
 	var pids selection.PIDList
-	var pattern, libvirtDir string
+	var pattern, libvirtDir, metricsAddress string
 	var refresh time.Duration
 	var once, rescue, traceStages, list, listQueues bool
 	fs.Var(&pids, "pid", "QEMU PID; repeat or provide a comma-separated list")
 	fs.StringVar(&pattern, "domain-regex", "", "Go regular expression selecting running libvirt domain names; combined with explicit PIDs")
 	fs.StringVar(&libvirtDir, "libvirt-state-dir", "/run/libvirt/qemu", "Read-only libvirt QEMU runtime XML directory")
 	fs.DurationVar(&refresh, "target-interval", 5*time.Second, "Rediscover selected domains at this interval (observe/recover only)")
+	fs.StringVar(&metricsAddress, "metrics-address", "", "Optional Prometheus listen address (for example 127.0.0.1:9475); empty disables metrics")
 	fs.BoolVar(&once, "once", false, "Compatibility alias for --mode kick")
 	fs.BoolVar(&rescue, "rescue", false, "Compatibility alias for --mode kick")
 	fs.BoolVar(&traceStages, "trace-stages", false, "Compatibility alias for --mode trace; requires --duration")
@@ -109,5 +110,5 @@ func parseConfig(args []string) (watch.ManagerConfig, error) {
 	if err != nil {
 		return watch.ManagerConfig{}, err
 	}
-	return watch.ManagerConfig{Agent: c, Selector: selector, Refresh: refresh, List: list, ListQueues: listQueues}, nil
+	return watch.ManagerConfig{Agent: c, Selector: selector, Refresh: refresh, List: list, ListQueues: listQueues, MetricsAddress: metricsAddress}, nil
 }

@@ -13,6 +13,17 @@ func runTrace(ctx context.Context, c Config, target *Target, bpf *BPF, l *logger
 	ticker := time.NewTicker(time.Duration(c.Interval * float64(time.Second)))
 	defer ticker.Stop()
 	snapshots := map[int]Snapshot{}
+	var pending, failed bool
+	var gap float64
+	var sampled, total int
+	lastCycle := monotonic()
+	finishMetrics := func() {
+		if pending && c.metricWorker != nil {
+			c.metricWorker.RecordPoll(0, sampled, total-sampled, time.Duration(gap*float64(time.Second)), failed)
+		}
+		pending = false
+	}
+	defer finishMetrics()
 	defer func() {
 		for _, s := range snapshots {
 			bpf.Forget(s)
@@ -26,8 +37,12 @@ func runTrace(ctx context.Context, c Config, target *Target, bpf *BPF, l *logger
 		if ctx.Err() != nil {
 			return l.err
 		}
+		now := monotonic()
+		gap, lastCycle = now-lastCycle, now
+		pending, failed, sampled, total = true, false, 0, 0
 		alive, err := target.CheckAlive()
 		if err != nil {
+			failed = true
 			return err
 		}
 		if !alive {
@@ -36,14 +51,17 @@ func runTrace(ctx context.Context, c Config, target *Target, bpf *BPF, l *logger
 		}
 		if c.CheckIdentity != nil {
 			if err := c.CheckIdentity(); err != nil {
+				failed = true
 				return err
 			}
 		}
 		vhosts, _, err := target.Inventory()
 		if err != nil {
+			failed = true
 			return err
 		}
 		rows := make([]QueueRow, 0, len(vhosts))
+		total = len(vhosts)
 		seen := map[int]bool{}
 		for _, fd := range vhosts {
 			if ctx.Err() != nil {
@@ -52,6 +70,7 @@ func runTrace(ctx context.Context, c Config, target *Target, bpf *BPF, l *logger
 			seen[fd] = true
 			s, row, err := liveRow(target, bpf, fd)
 			if err != nil {
+				failed = true
 				l.emit("queue_unavailable", map[string]any{"vhost_fd": fd, "error": err.Error()})
 				continue
 			}
@@ -59,16 +78,19 @@ func runTrace(ctx context.Context, c Config, target *Target, bpf *BPF, l *logger
 				bpf.Forget(old)
 				s, row, err = liveRow(target, bpf, fd)
 				if err != nil {
+					failed = true
 					return err
 				}
 			}
 			snapshots[fd] = s
 			row.Stages, err = bpf.Counters(s.VQ)
 			if err != nil {
+				failed = true
 				l.emit("queue_unavailable", map[string]any{"vhost_fd": fd, "error": err.Error()})
 				continue
 			}
 			rows = append(rows, row)
+			sampled++
 		}
 		for fd, s := range snapshots {
 			if !seen[fd] {
@@ -77,6 +99,7 @@ func runTrace(ctx context.Context, c Config, target *Target, bpf *BPF, l *logger
 			}
 		}
 		l.emit("trace_sample", map[string]any{"queues": rows, "stages_measured": true, "writes": uint64(0), "source": "live_snapshot"})
+		finishMetrics()
 		if l.err != nil {
 			return l.err
 		}

@@ -37,7 +37,7 @@ sudo podman run --rm --name vhost-queues --privileged --pid=host --network=none 
 | --- | --- |
 | `observe` (default) | Poll queues and report candidates; never write a recovery kick. |
 | `recover` | Use the same polling and candidate checks, validate live process/attachment/eventfd identity, write a kick when the checks pass, then observe backend consumption and used-ring progress. |
-| `kick` | Manually write one verified kick to each selected TX slot and exit. This intentionally bypasses candidate detection. |
+| `kick` | Manually attempt one verified kick per selected TX slot and exit, stopping that VM's slot traversal at the first refusal or error. This intentionally bypasses candidate detection. |
 | `trace` | Diagnose the initially selected targets with additional eventfd/vhost stage probes for an explicit bounded duration. It never automatically kicks. |
 
 Build the current source before using this interface; an already published image may contain an older CLI:
@@ -63,11 +63,13 @@ sudo podman run --detach --rm --name vhost-watch --privileged --pid=host --netwo
 
 Use one observing or recovering agent per selected process and share the state directory between containers. Domain selection refreshes every five seconds (`--target-interval 5s`) and can follow domain restarts. Explicit PIDs never follow a reused PID. Stop an existing observer before switching its selected processes to recovery.
 
-Both modes batch known user-ring reads every `--interval` (default **0.1 seconds**) and refresh the full QEMU FD inventory every `--inventory-interval` (default **5 seconds**). New or changed attachments can wait for the next inventory refresh. These defaults are candidate operating settings, not a guarantee against false kicks or a qualification of production overhead. A 25 ms cadence or a second live confirmation needs separate evidence before changing the policy.
+Both modes batch known user-ring reads every `--interval` (default **0.1 seconds**) and refresh the full QEMU FD inventory every `--inventory-interval` (default **5 seconds**). New or changed attachments can wait for the next inventory refresh. **100 ms is the owner's selected configuration**, matching the CLI default. A historical healthy 25 ms trial recorded one write whose necessity remains unknown; it does not establish a false positive or a lost notification. The owner withdrew further 25 ms testing and selected the 100 ms path. Neither cadence is a recovery-deadline guarantee or production qualification.
 
-A candidate needs outstanding descriptors across at least two observations without completion progress, followed by a live snapshot showing unconsumed descriptors. The queued bit being zero does **not** prove the vhost worker is idle: Linux clears that bit before calling the work handler. The live checks refuse queued work; absence of queued work still does not establish worker idleness or the underlying cause of a stall.
+A cached candidate needs a consistent outstanding descriptor count across at least two observations, separated by a cadence without used-ring completion progress; the avail index may continue changing. Live confirmation then checks that descriptors remain unconsumed. The queued bit being zero does **not** prove the vhost worker is idle: Linux clears that bit before calling the work handler. The live checks refuse queued work; absence of queued work still does not establish worker idleness or the underlying cause of a stall.
 
-Every recovery attempt refreshes FD inventory and validates the QEMU process, pinned vhost attachment, waiter/backend and nonblocking eventfd. Attempts and failures are paced from the end of validation, so actual retry gaps can exceed the requested interval. Recover retries while a validated candidate persists. A successful eventfd write, backend descriptor consumption, used-ring progress, and a verification timeout are distinct observations. Progress after a kick does **not** prove a lost notification, packet delivery, or application recovery. `--verify-timeout` (default 5 seconds) reports a write without observed progress; it does not end recovery retries.
+Before an accepted recovery write, the agent refreshes FD inventory and validates the QEMU process, pinned vhost attachment, waiter/backend and nonblocking eventfd. Earlier live decisions can refuse an attempt before this inventory refresh. Attempts and failures are paced from the end of validation, so actual retry gaps can exceed the requested interval. Recover retries while a validated candidate persists. A successful eventfd write, backend descriptor consumption, used-ring progress, and a verification timeout are distinct observations. `progress_after_kick` requires a later live snapshot in which **both consumption and used-ring indices differ from the first accepted write's baseline**. Progress after a kick does **not** prove a lost notification, packet delivery, or application recovery. `--verify-timeout` (default 5 seconds) reports a write without that combined progress; it preserves the verification baseline and does not end recovery retries.
+
+Recovery refuses a changed or unavailable attachment, inconsistent ring, completion progress since the cached sample, a drained queue, queued work, or no unconsumed descriptors. Immediately before writing, it checks the pinned eventfd and attachment identity again, the process is still alive, and cancellation has not been requested. This final snapshot validates identity; it does not perform another delayed ring-progress observation or prove the worker is idle. Read failures invalidate candidate timing and request rediscovery. A refusal never authorizes a write to a guessed or replacement target.
 
 Healthy summaries use cached user indices, not fresh kernel consumption state. Ring indices are 16-bit: a full wrap between samples can alias unchanged indices, so equal values do not prove no work occurred. `--summary-interval` controls summary cadence. The required low-frequency `vhost_net_ioctl` snapshot probe is shared across targets. Observe and recover do not load or attach the traffic-dependent diagnostic stage programs.
 
@@ -86,6 +88,22 @@ An episode has a **30-second diagnostic deadline**, enforced at the next complet
 
 Snapshots identify cached user indices versus a live snapshot. Host descriptor consumption and queued-work values are meaningful only when their freshness flags are set; consumption does not prove backend transmission or receiver delivery. `after_write` means only that the latest sample was taken after the first accepted write; progress can predate that write and does not prove causation or a lost notification. The **30-second episode timeout** bounds diagnostics; the separate `--verify-timeout` bounds the wait before reporting `recovery_unconfirmed`. Recovery verification retains the first write's baseline and originating `event_id` across episode closure or reopening. `progress_after_kick` and `recovery_unconfirmed` refer to that origin, and summaries retain the pending verification ID and timeout state. Neither timeout stops recovery retries.
 
+### Metrics
+
+Metrics are disabled by default. To expose `/metrics` on the Host's loopback interface, explicitly use Host networking and provide `--metrics-address`:
+
+```sh
+sudo podman run --detach --rm --name vhost-watch-metrics --privileged --pid=host --network=host --read-only --security-opt label=disable -v /sys/kernel/btf:/sys/kernel/btf:ro -v /var/lib/vhost-watch:/state:rw --log-driver=journald localhost/vhost-watch:dev --pid 1234,5678 --mode observe --metrics-address 127.0.0.1:9475
+```
+
+The exporter binds before target discovery or BPF setup; a bind failure aborts startup. All selected VMs share totals, while current queue coverage, open episodes and polling gaps aggregate only active workers. Labels use fixed reason, write result and progress outcome values; identity, PID, event ID and raw indices are excluded. A successful write and later queue progress remain separate observations.
+
+`candidates_total` counts diagnostic episode openings. `decisions_total` records one final fixed live/pre-write verdict per live confirmation call; syscall write failures and cancellation retain the last live verdict, while unavailable or changed attachments report their respective reason. `writes_total` counts every accepted kick, attempted syscall failure, or safety/cancellation refusal independently of journal rate limits. A stdout failure is not a kick failure or refusal. Manual kick contributes write results only; trace contributes polling health and queue coverage without creating candidates or writing kicks.
+
+`progress_total` counts **only closed diagnostic episodes** with `consumption`, `used`, `both`, `timeout`, or `identity_change` outcomes, at most once per episode. Quiet, unavailable, invalid-ring and stopped closures have no progress counter. Verification timeout warnings and later `progress_after_kick` reports use their own first-write baseline and do not increment this counter again. Episode progress can predate a write and does not establish causation.
+
+`poll_errors_total` counts cycles with at least one polling/observation error, including partial coverage failures, but not stdout failures, kick syscall failures or normal cancellation. Queue gauges describe the latest completed cycle. `poll_gap_seconds` reports the largest completed cycle gap or age since the last completed poll; `poll_max_gap_seconds` also includes current age. Never-polled workers do not contribute an age, and retired workers immediately stop contributing gauges.
+
 ### Manual kick
 
 Write one verified kick to every selected TX slot and exit:
@@ -100,7 +118,7 @@ Restrict the write to one current TX slot using a fresh `--list-queues` result:
 sudo podman run --rm --name vhost-kick --privileged --pid=host --network=none --read-only --security-opt label=disable -v /sys/kernel/btf:/sys/kernel/btf:ro -v /var/lib/vhost-watch:/state:rw localhost/vhost-watch:dev --pid 1234 --mode kick --vhost-fd 42
 ```
 
-Kick retains live identity and eventfd validation, bypasses the observer lock, and can run alongside an observing agent. It reports per-target JSON results and exits nonzero for unavailable targets or failed writes. A successful write alone is not recovery confirmation.
+Kick retains live identity and eventfd validation, bypasses the observer lock, and can run alongside an observing agent. It reports per-target JSON results and exits nonzero for unavailable targets or failed writes. The first refusal or error skips later slots in that VM; the manager still visits other selected VMs. A successful write alone is not recovery confirmation. `--once` and `--rescue` have this same contract: they exit after the selected writes, without waiting for progress. Supplying `--duration` does not turn a kick into a progress wait or a longer recovery run.
 
 ### Bounded diagnostic trace
 
@@ -121,7 +139,7 @@ Agent support is limited to Linux amd64, little-endian split rings, matching vho
 - `--mode guarded` and `--mode periodic` are rejected with migration guidance. Use `recover` for candidate-based recovery or `kick` for an intentional manual write.
 - `--threshold`, `--cooldown`, `--max-recoveries`, `--kick-interval`, and `--batch-rings` are rejected whenever explicitly supplied, including their old default values. Observe/recover batch known queue reads automatically; `--interval` controls candidate observation and retry pacing.
 
-Sub-500 ms application recovery, below-one-percent throughput regression, physical dual-25 Gbps ECMP behavior, and uninterrupted BFD/BGP sessions remain qualification targets. Large simultaneous faults and a Host-wide attempt cap have not been qualified. Continuous suppression of every wakeup, including recovery kicks, cannot be bypassed by this mechanism. Measure healthy traffic and application/session behavior separately before choosing a cadence.
+Sub-500 ms application recovery, below-one-percent throughput regression, physical dual-25 Gbps ECMP behavior, and uninterrupted BFD/BGP sessions remain qualification targets. Bounded 30/60-second current-version fault trains have been exercised on a selected queue, including longer single-peer BFD/BGP continuity checks; they do not qualify deployment scale. Large simultaneous faults and a Host-wide attempt cap have not been qualified. Continuous suppression of every wakeup, including recovery kicks, cannot be bypassed by this mechanism: a bounded five-second suppression test interrupted BFD/BGP continuity. A shorter polling cadence alone does not guarantee 500 ms recovery. Measure healthy traffic and application/session behavior separately before choosing a cadence. See [validation methods, bounded results and remaining qualification](VALIDATION.md).
 
 ## Host fault injection
 
@@ -135,7 +153,7 @@ sudo podman run --detach --rm --name vhost-fault --privileged --pid=host --netwo
 sudo podman logs -f vhost-fault
 ```
 
-The controller builds a small kernel module against the Host headers. During the bounded window, it suppresses at most `--drops` wakeups at the selected TX waiter's `vhost_poll_wakeup` entry. Other waiters are unaffected. Dropping a wakeup may leave pending descriptors without further notifications; a busy queue can also make progress and fail to stall. A `dropped` count alone is not proof of a persistent stall. Check ring progress after `disarmed`, then verify guest/application behavior.
+The controller builds a small kernel module against the Host headers. During the bounded window, it suppresses at most `--drops` wakeups at the selected TX waiter's `vhost_poll_wakeup` entry. It does not distinguish guest notifications from recovery kicks reaching that waiter. Other waiters are unaffected. Dropping a wakeup may leave pending descriptors without further notifications; a busy queue can also make progress and fail to stall. A `dropped` count alone is not proof of a persistent stall. Check ring progress after `disarmed`, then verify guest/application behavior.
 
 The default drops one wakeup. For a stronger controlled injection, increase `--drops`, for example to `1000`; the window still bounds the interruption. Delay and window are each limited to 60 seconds. The kernel enforces the window and schedules probe removal independently of the controller. The controller removes the module after the window, then waits for queue progress or the recovery deadline.
 
@@ -146,7 +164,7 @@ The default drops one wakeup. For a stronger controlled injection, increase `--d
 sudo podman stop --time 10 vhost-fault
 ```
 
-The controller sends a verified recovery kick on normal stop or when `--recover-after` expires. `--recover-after 0` disables the automatic deadline and waits for manual recovery or stop. The recovery deadline starts after the injection window ends. An experiment with no matching dropped wakeup exits nonzero.
+On normal stop or when `--recover-after` expires, the controller attempts a verified cleanup kick only after successful module unload, if progress has not already been observed and the original process/attachment remains alive and valid. Unload or identity-validation failure prevents that write. `--recover-after 0` disables the automatic deadline and waits for manual recovery or stop. The recovery deadline starts after the injection window ends. An experiment with no matching dropped wakeup exits nonzero, but its cleanup path may still write. Keep all controller cleanup kicks separate from automatic agent recovery evidence. The controller's `progress_observed` only checks a changed used index after disarm; it does not confirm consumption, packet delivery or BFD/BGP health.
 
 After a forced kill or controller crash, the kernel window still expires, but the module may remain loaded and retain the target vhost file. Remove it explicitly, then perform manual recovery with a freshly selected PID/FD:
 

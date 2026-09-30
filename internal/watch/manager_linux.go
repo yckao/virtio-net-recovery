@@ -15,11 +15,12 @@ import (
 )
 
 type ManagerConfig struct {
-	Agent      Config
-	Selector   *selection.Selector
-	Refresh    time.Duration
-	List       bool
-	ListQueues bool
+	Agent          Config
+	Selector       *selection.Selector
+	Refresh        time.Duration
+	List           bool
+	ListQueues     bool
+	MetricsAddress string
 }
 
 type lockedWriter struct {
@@ -65,6 +66,16 @@ func RunSelected(ctx context.Context, cfg ManagerConfig, output io.Writer) error
 		defer cancel()
 		traceOutput = newTraceWriter(output, cancel)
 		output = traceOutput
+	}
+	if cfg.MetricsAddress != "" {
+		if cfg.Agent.Metrics == nil {
+			cfg.Agent.Metrics = NewMetrics()
+		}
+		stop, err := cfg.Agent.Metrics.Start(ctx, cfg.MetricsAddress)
+		if err != nil {
+			return fmt.Errorf("metrics: %w", err)
+		}
+		defer stop()
 	}
 	writer := &lockedWriter{w: output}
 	log := &logger{encoder: json.NewEncoder(writer)}

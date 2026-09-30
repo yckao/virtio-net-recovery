@@ -23,6 +23,8 @@ type Config struct {
 	VhostFD                                                               int
 	Domain                                                                string
 	CheckIdentity                                                         func() error
+	Metrics                                                               *Metrics
+	metricWorker                                                          *WorkerMetrics
 }
 
 func (c Config) Validate() error {
@@ -111,6 +113,14 @@ func run(ctx context.Context, c Config, output io.Writer, shared *BPF) error {
 	if err := c.Validate(); err != nil {
 		return err
 	}
+	if c.Metrics != nil && c.Mode != "kick" {
+		var err error
+		c.metricWorker, err = c.Metrics.RegisterWorker()
+		if err != nil {
+			return err
+		}
+		defer c.metricWorker.Retire()
+	}
 	if c.Mode == "trace" && shared == nil {
 		child, cancel := context.WithTimeout(ctx, time.Duration(c.Duration*float64(time.Second)))
 		defer cancel()
@@ -166,7 +176,7 @@ func run(ctx context.Context, c Config, output io.Writer, shared *BPF) error {
 }
 
 // kick is the manual, one-shot entry point to the same verified write primitive.
-func kick(ctx context.Context, c Config, target *Target, bpf *BPF, l *logger) error {
+func kick(ctx context.Context, c Config, target liveQueueTarget, bpf snapshotter, l *logger) error {
 	vhosts, events, err := target.Inventory()
 	if err != nil {
 		return err
@@ -176,6 +186,7 @@ func kick(ctx context.Context, c Config, target *Target, bpf *BPF, l *logger) er
 		if c.VhostFD >= 0 && c.VhostFD != remoteFD {
 			continue
 		}
+		accepted := false
 		err = func() error {
 			if err := ctx.Err(); err != nil {
 				return err
@@ -197,10 +208,15 @@ func kick(ctx context.Context, c Config, target *Target, bpf *BPF, l *logger) er
 			if err := RekickContext(ctx, target, bpf, fd, s, events); err != nil {
 				return err
 			}
+			accepted = true
+			recordKickResult(c.Metrics, nil)
 			l.emit("kick_written", map[string]any{"vhost_fd": remoteFD, "eventfd_id": s.EventID, "implementation": "go", "progress": "unmeasured"})
 			return l.err
 		}()
 		if err != nil {
+			if !accepted {
+				recordKickResult(c.Metrics, err)
+			}
 			return err
 		}
 		written = true
@@ -209,4 +225,19 @@ func kick(ctx context.Context, c Config, target *Target, bpf *BPF, l *logger) er
 		return errors.New("no matching vhost TX queue in current inventory")
 	}
 	return nil
+}
+
+func recordKickResult(m *Metrics, err error) {
+	if m == nil {
+		return
+	}
+	var writeErr *KickWriteError
+	switch {
+	case err == nil:
+		m.Write(WriteSuccess)
+	case errors.As(err, &writeErr):
+		m.Write(WriteError)
+	default:
+		m.Write(WriteRefused)
+	}
 }
