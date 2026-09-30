@@ -514,6 +514,7 @@ func recoverLive(ctx context.Context, c Config, target liveQueueTarget, bpf snap
 	defer unix.Close(fd)
 	if q.policy.verification == nil {
 		q.journal.OpenForWrite(EpisodeReasonCandidate)
+		q.journal.RecordDecision(q.lastDecision)
 	}
 	if l.err != nil {
 		return l.err
