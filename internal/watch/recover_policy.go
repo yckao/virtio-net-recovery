@@ -9,14 +9,14 @@ import (
 // has no elapsed-incident deadline or lifetime recovery budget. An attempt is
 // charged before live validation, including a refused or unsuccessful attempt.
 type RecoveryPolicy struct {
-	Cadence             float64
-	Progress            RingProgress
-	LastAttempt         float64
-	LastAttemptStarted  float64
-	MaxAttemptGap       float64
-	Attempts, Writes    uint64
-	Refusals, Confirmed uint64
-	verification        *recoveryVerification
+	Cadence                       float64
+	Progress                      RingProgress
+	LastAttempt                   float64
+	LastAttemptStarted            float64
+	MaxAttemptGap                 float64
+	Attempts, Writes, WriteErrors uint64
+	Refusals, Confirmed           uint64
+	verification                  *recoveryVerification
 }
 
 type recoveryVerification struct {

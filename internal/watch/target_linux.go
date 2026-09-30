@@ -175,6 +175,17 @@ type recoveryTarget interface {
 }
 type snapshotter interface{ Snapshot(int) (Snapshot, error) }
 
+// KickWriteError reports a failure after attempting the eventfd write. Safety
+// checks that refuse a write return ordinary errors instead.
+type KickWriteError struct{ Err error }
+
+func (e *KickWriteError) Error() string { return fmt.Sprintf("eventfd kick write: %v", e.Err) }
+func (e *KickWriteError) Unwrap() error { return e.Err }
+
+// ErrKickIdentityChanged marks an observed identity mismatch, separately from
+// an unavailable snapshot or failure to read/duplicate a descriptor.
+var ErrKickIdentityChanged = errors.New("kick identity changed")
+
 // Rekick pins the exact eventfd and revalidates its current vhost attachment.
 // It never changes file flags, so duplicated FDs cannot alter QEMU's flags.
 func Rekick(target recoveryTarget, bpf snapshotter, vhostFD int, s Snapshot, events map[uint32][]int) error {
@@ -204,7 +215,7 @@ func RekickContext(ctx context.Context, target recoveryTarget, bpf snapshotter, 
 		return err
 	}
 	if id != s.EventID {
-		return errors.New("duplicated eventfd identity changed")
+		return fmt.Errorf("duplicated eventfd identity changed: %w", ErrKickIdentityChanged)
 	}
 	flags, err := unix.FcntlInt(uintptr(fd), unix.F_GETFL, 0)
 	if err != nil {
@@ -221,7 +232,7 @@ func RekickContext(ctx context.Context, target recoveryTarget, bpf snapshotter, 
 		return err
 	}
 	if current.Identity() != s.Identity() || !target.Alive() {
-		return errors.New("queue identity changed before recovery")
+		return fmt.Errorf("queue identity changed before recovery: %w", ErrKickIdentityChanged)
 	}
 	if err := ctx.Err(); err != nil {
 		return err
@@ -230,10 +241,10 @@ func RekickContext(ctx context.Context, target recoveryTarget, bpf snapshotter, 
 	binary.NativeEndian.PutUint64(data[:], 1)
 	n, err := unix.Write(fd, data[:])
 	if err != nil {
-		return err
+		return &KickWriteError{Err: err}
 	}
 	if n != 8 {
-		return errors.New("short eventfd write")
+		return &KickWriteError{Err: errors.New("short eventfd write")}
 	}
 	return nil
 }
