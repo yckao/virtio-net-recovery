@@ -134,8 +134,8 @@ jobs:
             Organization) namespace=orgs ;;
             *) echo "Unsupported package owner type: $owner_type" >&2; exit 1 ;;
           esac
-          package=${REPOSITORY#*/}$SUFFIX
-          endpoint="$namespace/$OWNER/packages/container/${package,,}"
+          package=$(printf '%s' "${REPOSITORY#*/}$SUFFIX" | tr '[:upper:]' '[:lower:]')
+          endpoint="$namespace/$OWNER/packages/container/$package"
           echo "endpoint=$endpoint" >> "$GITHUB_OUTPUT"
           response=$(mktemp)
           trap 'rm -f "$response"' EXIT
