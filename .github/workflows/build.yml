@@ -1,4 +1,4 @@
-name: Validate modular replacement
+name: Validate recovery
 on:
   pull_request:
   push:
@@ -21,12 +21,11 @@ jobs:
         with:
           go-version-file: go.mod
           check-latest: true
-          cache-dependency-path: '**/go.sum'
-      - name: Contracts and independent module boundaries
+          cache-dependency-path: go.sum
+      - name: Contracts and package boundaries
         run: |
-          test -z "$(gofmt -l modules apps tools)"
+          test -z "$(gofmt -l recovery evidence discovery vhost internal cmd)"
           make test check linux
-          python3 tools/test-independent.py --online
       - name: Compile matching BPF and experiment assets
         run: |
           sudo apt-get update

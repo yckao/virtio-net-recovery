@@ -4,9 +4,7 @@
 backlog
 backlog.config.yml
 AGENTS.md
-evidence
 docs
-tools
 output
 **/__pycache__
 **/*.o

@@ -13,7 +13,6 @@ bin/
 /AGENTS.md
 /backlog/
 /backlog.config.yml
-/evidence/
 .worktrees/
 output/
 # Host-specific historical material is never part of a module release.

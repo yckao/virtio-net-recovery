@@ -1,16 +1,21 @@
 FROM docker.io/library/ubuntu:24.04 AS bpf-build
 RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
     clang gcc make libbpf-dev libelf-dev libc6-dev linux-libc-dev && rm -rf /var/lib/apt/lists/*
-COPY modules/vhost-linux/ /build/
+COPY vhost/ /build/
 RUN make -C /build
 
 FROM docker.io/library/golang:1.26.5-bookworm AS go-build
 WORKDIR /src
-COPY go.mod go.work ./
-COPY modules ./modules
-COPY apps ./apps
-RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -o /out/vhost-agent ./apps/vhost-agent/cmd/vhost-agent && \
-    CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -o /out/vhost-faultlab ./apps/vhost-faultlab/cmd/vhost-faultlab
+COPY go.mod go.sum ./
+RUN go mod download
+COPY recovery ./recovery
+COPY evidence ./evidence
+COPY discovery ./discovery
+COPY vhost ./vhost
+COPY internal ./internal
+COPY cmd ./cmd
+RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -o /out/vhost-agent ./cmd/vhost-agent && \
+    CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -o /out/vhost-faultlab ./cmd/vhost-faultlab
 
 FROM docker.io/library/ubuntu:24.04 AS fault
 RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \

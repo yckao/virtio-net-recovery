@@ -1,60 +1,47 @@
-# Modular replacement: implementation review
+# Implementation review
 
-Status: implementation candidate for owner review, 2026-10-09. The previous five pull requests were closed without merging or deleting their branches. This replacement starts from clean trunk `2bb7f4c`; it does not incorporate the rejected PR stack's architecture. Existing unrelated checkout changes remain preserved.
+Status: revised candidate for owner review, 2026-10-09. PR #8 remains a draft. The previous implementation was rejected for excessive packaging machinery and insufficient internal separation. This revision changes the code and ownership model, not just the directory layout.
 
-## Review the actual code
+## Review entry points
 
-| Concern | Entry point | What to inspect |
+| Concern | Source | Review question |
 | --- | --- | --- |
-| Temporal policy | `modules/recovery-core/policy.go`, `completion.go`, `verification.go` | Validated operation receipts; completion pacing; generation replacement; first accepted baseline; no side effects |
-| Evidence internals | `modules/recovery-evidence/recorder.go`, `history.go`, `episode.go` | Own closed input contract, owned history copies, bounded output, gap reset, late verification attribution; imports only `errors` and `time` |
-| Linux effect boundary | `modules/vhost-linux/notify_operation.go`, `notify_linux.go` | Final live physical classification, pinned descriptors, one write, actual acceptance timestamp and cleanup ownership |
-| Application control | `apps/vhost-agent/internal/control/worker.go`, `manual.go`, `trace.go` | Consumer-owned ports; one policy per slot; invalid inventory breaks continuity; accepted counters before telemetry |
-| Composition/lifetime | `apps/vhost-agent/internal/supervision/supervisor.go`, `internal/cli` | Replacement joins cleanup; unknown inventory retains workers; cleanup failure prevents replacement; manual output never repeats writes |
-| Diagnostics/delivery | `apps/vhost-agent/internal/diagnostics`, `internal/jsonlog` | Separate bounded workers, sequence loss invalidates evidence, output backpressure never runs on a recovery worker |
-| Experiment | `apps/vhost-faultlab/internal/experiment`, `internal/backend` | Independent controller; unload before restoration; narrow synchronous borrowed binding; no agent/core/evidence dependency |
-| Enforced dependencies | `docs/architecture/dependencies.json`, `tools/check-boundaries` | Exact package/test edges and reachable public types; no accidental producer types in evidence |
+| Build weight | Root `go.mod`, `Makefile` | Can an ordinary root Go command build and test everything? |
+| Component independence | `internal/architecture/architecture_test.go` | Are dependencies explicit for public components and application packages, including tests/platform files? |
+| Command flow | `internal/agent/cli/run.go`, `kick.go`, `queues.go` | Is dispatch performed once, with relevant flags and direct command flow? |
+| Manual ownership | `internal/agent/control/commands.go`, `manual.go` | Do typed results preserve receipts and errors through cancellation and cleanup? |
+| Recovery worker | `internal/agent/control/worker.go` | Are inventory, per-queue policy, effects and coverage distinct responsibilities? |
+| Process lifetime | `internal/agent/supervision/supervisor.go` | Does one session own reader/notifier/lease cleanup, and are failed admissions visible? |
+| Evidence internals | `evidence/recorder.go`, `history.go`, `episode.go` | Does the recorder own atomic observation ordering without producer knowledge? |
+| Optional telemetry | `internal/agent/telemetry` | Are input/output loss independent, retained data bounded and final admitted frames drained? |
+| Linux requests | `vhost/internal/kernel/probe_linux.go`, `vhost/session_linux.go` | Are snapshots attributed to the requesting thread and known queues preserved under capacity? |
+| Experiment | `internal/faultlab/cli`, `experiment/controller.go` | Are commands direct and unload-before-restoration errors preserved? |
 
-No global interface registry, shared domain-model warehouse, generic event bus or compatibility layer was added. The application owns explicit translations because the meanings differ: a backend physical decision, a policy result, an evidence input and a delivered record are separate contracts. The overhead is a small amount of intentional mapping code and six release manifests.
+## Corrections
 
-The only temporary filesystem replacements are exact candidate versions in the development `go.work`, required while those module versions are unpublished. Every release module's `go.mod` is replace-free; independent tests disable the workspace entirely.
+- Removed six module manifests, `go.work`, the candidate proxy runner and the separate boundary-check executable. Public package boundaries remain explicit in one root module.
+- Removed the mode-driven `oneShot/executeTarget` path. Listing and kicking acquire distinct capabilities and return distinct result types. Errors remain errors until presentation. Malformed inventories cannot repeat a manual write.
+- Each command accepts only its own flags. Command output has one writer for the invocation. An accepted kick receipt survives cancellation through a separate delivery deadline; cancellation and output failure prevent later target effects.
+- Removed control-owned telemetry stream IDs, registry and delivery counters. A scoped observer is the only optional telemetry port. Invalid cached observations and absent live samples cannot become fresh evidence.
+- Reduced diagnostics/report/JSON queue layers to one telemetry package with two bounded FIFOs, drop-new behavior and distinct reducer/writer ownership. Closing a queue drains its admitted final observations before retirement. Each optional service gets its own shutdown deadline.
+- Evidence receives sample and candidate state atomically, avoiding false quiet closure/reopening at the same boundary. Sample acquisition time remains distinct from record accounting time.
+- Failed process admissions and incomplete inventory have authoritative counters. Explicit zero-admission daemon requests fail with diagnostics disabled. Attempt outcomes include read failures and cancellation.
+- Trace requires one complete sweep across all frozen targets; timeout before that is incomplete. Cleanup errors survive ordinary cancellation.
+- BPF snapshot attribution now matches the locked requesting OS thread. Wire schema 3 rejects old mailbox objects. Queue capacity reconciles known slots and confirmed removals before new admissions; truncation is explicit instead of a fake FD.
+- Faultlab also uses direct handlers and typed presentation. An accepted restoration preserves any subsequent error instead of clearing it.
 
-## Executable review
+## Validation
 
-```sh
-make test check
-make independent
-# Pure examples: no privileges, backend, observer or evidence exporter required.
-go run ./modules/recovery-core/examples/replay
-go run ./modules/recovery-evidence/examples/replay
-make linux
-```
+Root race tests, vet and native builds pass. Linux amd64 packages and tests cross-compile and pass vet. Boundary tests parse all Go files regardless of the current OS. Generated wire files reproduce byte-for-byte and the C layout's static assertions compile with the local C compiler.
 
-Public contract tests cover completion-based retry spacing, refusal/failure accounting, unavailable samples, process/attachment replacement, partial inventory, ring wrap, history ownership, gaps, late verdicts and bounded churn. A deterministic application integration runs the actual control worker with diagnostics disabled and then with a permanently blocked writer. Attempt timestamps and authoritative counts match; a 50 ms operation plus a 100 ms cadence yields 150 ms spacing. A blocked writer occupies one bounded in-flight slot and shutdown returns on its deadline.
+Focused regressions cover cancellation after accepted writes, cleanup failures, partial inventory, duplicate slots, first-sweep trace coverage, process admission, malformed observation batches, evidence quiet-boundary ordering, admitted-frame retirement, trailing input gaps and output failure. A deterministic test runs the actual recovery worker with diagnostics disabled and with a blocked writer; attempt timestamps and accepted counts match.
 
-Boundary tests deliberately introduce a forbidden production import, forbidden test import, exported alias leak and nested generic/container type leak. They are rejected. Core and evidence also have explicit production standard-library allowlists (`errors`, `time`); extra I/O imports fail. An opaque type with private state is accepted. Static checks enforce declared dependencies, not conceptual independence by themselves; the package ownership table and implementation remain part of review.
+Cross-compilation is not Linux test execution. The modified BPF program has not been loaded or exercised against a live QEMU process in this revision. Previous implementation tests and closed-PR Lab measurements are historical and do not qualify this source. No Lab/VM operation was performed during this rewrite.
 
-## Measured Linux checks
+The host currently has no running Docker daemon or BPF-capable compiler. Container/BPF compilation is configured in the repository workflow; any remote run result is reported separately in the PR. No image is published by that workflow.
 
-Executed on an isolated Linux amd64 probe VM (`6.12.51-0-virt`), separate from the existing Lab workloads:
+## Remaining limits
 
-- Backend guard/public-contract tests executed successfully.
-- Real eventfd write/saturation, process memory batch read/partial-read invalidation and cooperative mutation lock tests executed successfully.
-- Observation and trace BPF objects compiled with Clang 20.1.8 against Linux/libbpf headers.
-- Both BPF program sets loaded and attached. Five open/close cycles per mode completed with a stable six-descriptor process count after each close. This tests resource lifecycle, not traffic-path correctness under load.
-- Both Linux CLI binaries ran their help entrypoints.
-- `vhost-faultlab prepare` compiled its embedded kernel asset against available `6.12.112-0-virt` headers. The artifact was not loaded; its build kernel differs from the probe's running kernel.
+This candidate has no live QEMU traffic, BFD/BGP, sustained multi-target overhead or fault-injection qualification. Backend generation checks and cooperating locks do not create an atomic transaction with kernel state; unobserved ABA remains a limitation. A blocked arbitrary `io.Writer` cannot be force-cancelled, so one bounded writer goroutine can remain until the destination returns or the CLI process exits.
 
-Temporary compiler/header package groups and test files were removed, the test driver was unloaded, and the probe VM was returned to its prior stopped state. APK dependency resolution updated the probe's existing musl, xz-libs, zlib and libexpat packages; those base-library updates remain. No production/Lab workloads or experiment module were touched.
-
-The independent candidate-proxy gate also copies all six modules plus repository tooling outside the workspace, runs native race tests/vet/build, compiles and vets Linux variants, and runs four standalone public consumers. Linux cross-compilation is explicitly distinct from executing the syscall and BPF checks above.
-
-## Deliberate limits and integration changes
-
-This delivery does not claim live QEMU queue recovery, sustained multi-target overhead, traffic-path trace correctness, BFD/BGP continuity or fault-injection cleanup qualification for the replacement. Those require a separately owned disposable QEMU/guest workload on the target kernel. Historical results from the closed PRs are not evidence for this source.
-
-The backend detects observed attachment generations; an unobserved complete ABA reconfiguration cannot be ruled out by a raw-address identity tuple. Generation checks, descriptor pinning and locks reduce race exposure but do not form an atomic kernel transaction. Locks coordinate cooperating instances only.
-
-The recovery-once caller is external to this repository. Its replacement command is `vhost-agent kick`. Schema 1 emits one bounded target-result line after that target's effects finish, then a command-summary line. A delivery failure stops subsequent targets and exits 3; receipts may already represent accepted writes. The caller must not blindly retry exit 3. No legacy aliases or result serializers were retained.
-
-The project-wide distribution license is still unspecified. Backend/fault kernel notices are retained; independent public release additionally requires the licensing and version steps in `releasing.md`. Container build recipes and CI are updated; local container images have not been built because no Docker daemon was running.
+The recovery-once wrapper is external and must adopt `vhost-agent kick` and schema 1. Exit 3 must not trigger automatic retries. Project-wide distribution licensing remains undecided; retained kernel notices do not license all Go source.
