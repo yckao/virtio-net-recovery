@@ -1,16 +1,13 @@
 .git
 .github
+.worktrees
 backlog
 backlog.config.yml
 AGENTS.md
 evidence
 docs
 tools
-tests
-agent/agent.py
-agent/native.c
-fault-injection/drop_notify.c
-fault-injection/Makefile
+output
 **/__pycache__
 **/*.o
 **/*.so
@@ -21,5 +18,4 @@ fault-injection/Makefile
 **/Module.symvers
 **/modules.order
 bin
-
-!go.mod
+!**/go.mod

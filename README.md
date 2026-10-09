@@ -1,120 +1,56 @@
-# virtio-net-recovery
+# Modular vhost recovery
 
-A Go Host agent for virtio-net / vhost-net TX queues that may stop making progress. It observes queue progress and can write a verified kick to the queue's eventfd to wake vhost. This is a recovery workaround; it does not identify or fix the underlying cause.
+A replacement implementation for observing and recovering stalled Linux vhost-net TX queues. It separates temporal recovery policy, Linux access, process discovery, evidence recording and application composition into independently buildable Go modules.
 
-The agent runs in a container on the QEMU Host. It supports multiple QEMU PIDs, libvirt domain name regular expressions, automatic recovery, and manual one-shot recovery. A separate container injects a bounded lost wakeup entirely on the Host. Neither requires software installation in the guest.
+**Implementation review candidate; not production-qualified.** A successful eventfd write is not proof of guest traffic, BFD or BGP recovery. The prior PR stack is closed and has not been merged into this branch.
 
-## Requirements
+| Module | Responsibility | Direct project dependencies |
+| --- | --- | --- |
+| [recovery-core](modules/recovery-core) | Deterministic candidate, retry and verification state | None |
+| [vhost-linux](modules/vhost-linux) | Linux process/queue identity, observation and guarded writes | None |
+| [qemu-discovery](modules/qemu-discovery) | QEMU generation selection from procfs/libvirt | None |
+| [recovery-evidence](modules/recovery-evidence) | Bounded history and episode reduction | None |
+| [vhost-agent](apps/vhost-agent) | Application workflows, translation and delivery | The four libraries |
+| [vhost-faultlab](apps/vhost-faultlab) | Explicitly scoped disposable fault experiments | vhost-linux |
 
-- Linux x86-64, QEMU with vhost-net, little-endian split virtqueues, and kernel BTF (`/sys/kernel/btf`). Packed rings and IOMMU-translated rings are unsupported.
-- Rootful Podman, Host PID namespace, and permission to use BPF, `pidfd_getfd`, and `process_vm_readv`. The examples use privileged containers.
-- For domain regex selection, mount the libvirt runtime XML directory (normally `/run/libvirt/qemu`). This is read-only discovery and requires no libvirt socket access.
-- For fault injection, matching Host kernel headers under `/lib/modules` and `/usr/src`, loadable kernel modules, and a matching compiler. The fault image includes GCC 12; the verified kernel is Ubuntu `6.8.0-52-generic`. Other kernels require validation of their vhost internals. Kernel lockdown or module-signing policy may prevent injection.
+Libraries do not share a domain-object package. Applications translate public contracts through consumer-owned ports. Internal package edges, test imports and reachable public API types are checked in [the dependency gate](docs/architecture/dependencies.json). Evidence knows neither recovery policy nor Linux; it owns no goroutine, I/O, encoding, clock or callback.
 
-The current repository and GHCR packages are private. Log in using a GitHub token with `read:packages` access as the password when prompted:
+## Build and inspect
 
-```sh
-sudo podman login ghcr.io -u YOUR_GITHUB_USER
-sudo podman pull ghcr.io/yckao/virtio-net-recovery:main
-sudo podman pull ghcr.io/yckao/virtio-net-recovery-fault:main
-```
-
-## Select and inspect VMs
-
-Run these one-line commands directly on the QEMU Host; no launcher scripts or repository checkout are needed. Create the shared state directory once with `sudo mkdir -p /var/lib/vhost-watch`. `--pid` accepts repeated flags or a comma-separated list. Explicit PIDs and regex matches form a deduplicated union. Regex uses Go syntax; anchor it when selecting exact names.
+Go 1.25 or newer is required. Workspace builds use local modules. Individual release checks use `GOWORK=off`, candidate dependency versions from a temporary file proxy and external public consumers. No module contains a filesystem `replace` directive.
 
 ```sh
-sudo podman run --rm --name vhost-list --privileged --pid=host --network=none --read-only --security-opt label=disable -v /run/libvirt/qemu:/run/libvirt/qemu:ro ghcr.io/yckao/virtio-net-recovery:main --domain-regex '^worker-' --list
-
-sudo podman run --rm --name vhost-queues --privileged --pid=host --network=none --read-only --security-opt label=disable -v /sys/kernel/btf:/sys/kernel/btf:ro -v /var/lib/vhost-watch:/state:rw ghcr.io/yckao/virtio-net-recovery:main --pid 1234 --list-queues
+make test                 # all module race tests and vet
+make check                # dependency and public API boundaries
+make independent          # isolated module builds and public consumers
+make build                # native CLI binaries (non-Linux backend refuses access)
+make linux                # Linux amd64 CLI binaries
+make bpf                  # Linux: matching observation and trace objects
 ```
 
-`--list-queues` reports the current QEMU `vhost_fd` for each configured TX slot. A vhost FD is process-local and can change after restart or device reconfiguration; it is not a guest queue number. Select it from a fresh listing.
+The backend supports Linux amd64, split virtqueues and the kernel facilities documented in its README. Build BPF with Clang, Linux headers and libbpf headers. Generated wire layout includes schema and field-offset checks. Backend BPF objects must come from the same release as its Go code.
 
-## Start the agent
-
-Observe without writing recovery kicks:
+## Commands
 
 ```sh
-sudo podman run --detach --rm --name vhost-watch --privileged --pid=host --network=none --read-only --security-opt label=disable -v /sys/kernel/btf:/sys/kernel/btf:ro -v /var/lib/vhost-watch:/state:rw --log-driver=k8s-file --log-opt=max-size=10mb ghcr.io/yckao/virtio-net-recovery:main --pid 1234,5678 --mode observe
+vhost-agent list --pid 1234
+vhost-agent list-queues --pid 1234 --bpf ./vhost-observe.bpf.o
+vhost-agent observe --domain '^example-' --bpf ./vhost-observe.bpf.o
+vhost-agent recover --pid 1234 --bpf ./vhost-observe.bpf.o --metrics 127.0.0.1:9090
+vhost-agent kick --pid 1234 --bpf ./vhost-observe.bpf.o
+vhost-agent trace --pid 1234 --bpf ./vhost-trace.bpf.o --duration 10s
 ```
 
-Enable guarded recovery for matching domains:
+`observe` is the default command. Explicit PID selection stays anchored to the first observed process generation. Domain selection can discover a replacement process. Automatic recovery needs outstanding work with no used progress across the configured cadence and a fresh backend decision. Every attempt, including refusals and failed writes, is paced from completion. Accepted writes are counted immediately; later same-generation consumed and used progress is reported separately.
 
-```sh
-sudo podman run --detach --rm --name vhost-watch --privileged --pid=host --network=none --read-only --security-opt label=disable -v /sys/kernel/btf:/sys/kernel/btf:ro -v /var/lib/vhost-watch:/state:rw --log-driver=k8s-file --log-opt=max-size=10mb -v /run/libvirt/qemu:/run/libvirt/qemu:ro ghcr.io/yckao/virtio-net-recovery:main --domain-regex '^worker-' --mode guarded --batch-rings --interval 0.02 --threshold 0.04
-```
+`kick` is the new manual contract: one guarded write per selected supported slot, without candidate timing. It emits one bounded JSON result after each target's effects finish, followed by a command summary. Output failure stops subsequent targets. Exit `0` means complete execution/delivery, `2` means incomplete execution, and `3` means delivery failed. **Never blindly retry exit 3: some or all writes may already have succeeded.** The external recovery-once wrapper should invoke `kick` and consume schema 1; that wrapper is not present in this repository. Removed mode aliases and old schemas are not retained.
 
-The example checks ring progress every 20 ms, then confirms a suspected stall against live vhost state twice before writing. A shared BPF snapshot probe serves all selected VMs. Recovery verifies the current QEMU process, vhost attachment, and eventfd identity. It then checks for consumed/used progress. This confirms Host queue progress; service health needs a separate application check.
+Automatic diagnostics are best effort. Fixed-cardinality counters are updated before a nonblocking frame offer. A bounded diagnostic worker calls the evidence recorder; a separate bounded byte queue writes JSON. Missing input sequences invalidate evidence continuity. A stuck destination cannot hold a recovery worker. `--diagnostics=false` removes the evidence path. Metrics distinguish accepted writes, later progress, coverage, input loss and output loss.
 
-Per-queue defaults limit guarded recovery to one attempt every 30 seconds and three attempts per hour. Domain selection refreshes every five seconds (`--target-interval 5s`) and follows domain restarts. Explicit PIDs never follow a reused PID. Each VM has a separate observer lock and recovery state; use the same `/var/lib/vhost-watch` state directory for all containers.
+Recovery ownership uses a process lease; each backend mutation also takes a short lock shared with manual writes. These locks coordinate cooperating tools only. They cannot make userspace observation and eventfd writes atomic with kernel state changes.
 
-Polling and extra kicks have overhead. The 20 ms configuration is an experiment setting, not a throughput or latency guarantee. Five VMs with 60 RX/TX queue pairs each have not been qualified. `--trace-stages` adds traffic-path probes and should be reserved for diagnostics. `--mode periodic --kick-interval 0.1` sends unconditional kicks and is not the recommended default.
+## Review and qualification
 
-```sh
-sudo podman logs -f vhost-watch
-sudo podman stop --time 10 vhost-watch
-```
+Start with [the approved architecture](docs/architecture/design.md), then [implementation review and measured validation](docs/implementation-review.md). Tests exercise public contracts, bounded resources, identity replacement, refusal/failure timing and optional-output isolation. The current branch does not claim replacement-version QEMU traffic/BFD/BGP or fault-injection qualification.
 
-## Manual recovery: run once
-
-Write one verified kick to every selected TX slot and exit:
-
-```sh
-sudo podman run --rm --name vhost-recovery --privileged --pid=host --network=none --read-only --security-opt label=disable -v /sys/kernel/btf:/sys/kernel/btf:ro -v /var/lib/vhost-watch:/state:rw -v /run/libvirt/qemu:/run/libvirt/qemu:ro ghcr.io/yckao/virtio-net-recovery:main --domain-regex '^worker-' --once
-```
-
-Restrict manual recovery to one current TX slot in one VM:
-
-```sh
-sudo podman run --rm --name vhost-recovery --privileged --pid=host --network=none --read-only --security-opt label=disable -v /sys/kernel/btf:/sys/kernel/btf:ro -v /var/lib/vhost-watch:/state:rw ghcr.io/yckao/virtio-net-recovery:main --pid 1234 --once --vhost-fd 42
-```
-
-`--once` deliberately bypasses stall detection and the observer lock, so it can run alongside an observing agent. It reports per-target results as JSON and exits nonzero for unavailable targets or failed writes. A successful write is not proof that application traffic recovered.
-
-## Host fault injection
-
-Use a test VM with active guest TX traffic. Keep an independent management path available. Start with an observing agent so automatic recovery does not hide the stall. No guest fault module is used.
-
-1. Use `--list-queues` to select a current TX `vhost_fd`.
-2. Start the fault container, selecting exactly one VM and one FD:
-
-```sh
-sudo podman run --detach --rm --name vhost-fault --privileged --pid=host --network=none --read-only --security-opt label=disable --tmpfs /tmp:rw,size=256m -v /lib/modules:/lib/modules:ro -v /usr/src:/usr/src:ro -v /sys/kernel/btf:/sys/kernel/btf:ro -v /var/lib/vhost-watch:/state:rw ghcr.io/yckao/virtio-net-recovery-fault:main --pid 1234 --vhost-fd 42 --delay 2s --window 500ms --drops 1 --recover-after 30s
-sudo podman logs -f vhost-fault
-```
-
-The controller builds a small kernel module against the Host headers. During the bounded window, it suppresses at most `--drops` wakeups at the selected TX waiter's `vhost_poll_wakeup` entry. Other waiters are unaffected. Dropping a wakeup may leave pending descriptors without further notifications; a busy queue can also make progress and fail to stall. A `dropped` count alone is not proof of a persistent stall. Check ring progress after `disarmed`, then verify guest/application behavior.
-
-The default drops one wakeup. For a stronger controlled injection, increase `--drops`, for example to `1000`; the window still bounds the interruption. Delay and window are each limited to 60 seconds. The kernel enforces the window and schedules probe removal independently of the controller. The controller removes the module after the window, then waits for queue progress or the recovery deadline.
-
-3. While the queue remains stalled, trigger `--once --vhost-fd` as shown above and verify traffic resumes.
-4. Stop the injector when finished:
-
-```sh
-sudo podman stop --time 10 vhost-fault
-```
-
-The controller sends a verified recovery kick on normal stop or when `--recover-after` expires. `--recover-after 0` disables the automatic deadline and waits for manual recovery or stop. The recovery deadline starts after the injection window ends. An experiment with no matching dropped wakeup exits nonzero.
-
-After a forced kill or controller crash, the kernel window still expires, but the module may remain loaded and retain the target vhost file. Remove it explicitly, then perform manual recovery with a freshly selected PID/FD:
-
-```sh
-sudo podman run --rm --name vhost-fault-cleanup --privileged --pid=host --network=none --read-only --security-opt label=disable -v /var/lib/vhost-watch:/state:rw ghcr.io/yckao/virtio-net-recovery-fault:main --cleanup
-sudo podman run --rm --name vhost-recovery --privileged --pid=host --network=none --read-only --security-opt label=disable -v /sys/kernel/btf:/sys/kernel/btf:ro -v /var/lib/vhost-watch:/state:rw ghcr.io/yckao/virtio-net-recovery:main --pid 1234 --once
-```
-
-`--cleanup` only removes the module; it does not guess a recovery target. A Host permits one fault controller at a time. Do not restart or hot-unplug the selected VM device during an injection experiment.
-
-## Build and images
-
-```sh
-go test -race ./...
-make build
-sudo podman build --target agent -f deploy/Containerfile -t localhost/vhost-watch:dev .
-sudo podman build --target fault -f deploy/Containerfile -t localhost/vhost-fault:dev .
-```
-
-`make build` requires Go 1.25 or later, Clang, libbpf headers, and a Linux x86-64 build environment. To use local images, replace the GHCR image reference in a command with the corresponding `localhost/...:dev` tag. Choose a different `--name` when running concurrent inspections or one-shot calls.
-
-GitHub Actions run Go race tests and vet, compile BPF and the Host module, and build both Linux amd64 images. Pushes to `main`, version tags, and manual runs publish to GHCR using `GITHUB_TOKEN`, then pull each digest and verify its revision, CLI, and package visibility. Tags include `main`, full `sha-<commit>`, and version tags for `v*` releases. Private repository publication requires private package visibility; publication does not make either package public.
+Each module includes its own README and notices. Independent publication still requires selecting the project license, reviewing GPL kernel-asset obligations, publishing dependency versions and qualifying the target kernels; see [release policy](docs/releasing.md). Local candidate versions are not published releases.
