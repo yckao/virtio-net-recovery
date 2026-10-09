@@ -266,3 +266,35 @@ func TestTraceCannotSucceedBeforeEverySelectedTargetHasACompleteFrame(t *testing
 	assertTraceClosed(t, first)
 	assertTraceClosed(t, second)
 }
+
+func TestTraceDoesNotStartNextTargetAfterCancellation(t *testing.T) {
+	first, a := newTraceTarget(101)
+	second, b := newTraceTarget(202)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	sink := &traceSink{deliver: func(context.Context, control.TraceFrame) error { cancel(); return nil }}
+	err := control.RunTrace(ctx, traceOptions(), []control.TraceTarget{a, b}, traceClock(), sink)
+	if !errors.Is(err, control.ErrTraceIncomplete) || first.reads != 1 || second.reads != 0 {
+		t.Fatalf("err=%v reads=%d/%d", err, first.reads, second.reads)
+	}
+	assertTraceClosed(t, first)
+	assertTraceClosed(t, second)
+}
+func TestTracePreservesReadFailureJoinedWithCancellationAfterCoverage(t *testing.T) {
+	fixture, target := newTraceTarget(101)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	failure := errors.New("trace read failed")
+	fixture.read = func(ctx context.Context, queues []control.Queue) ([]control.TraceSample, error) {
+		if fixture.reads == 1 {
+			return traceSamples(queues), nil
+		}
+		cancel()
+		return nil, errors.Join(ctx.Err(), failure)
+	}
+	err := control.RunTrace(ctx, traceOptions(), []control.TraceTarget{target}, traceClock(), &traceSink{})
+	if !errors.Is(err, failure) {
+		t.Fatal("cancellation erased a required read failure", err)
+	}
+	assertTraceClosed(t, fixture)
+}

@@ -84,7 +84,7 @@ func RunTrace(ctx context.Context, options TraceOptions, targets []TraceTarget, 
 		}
 		start := clock.Now()
 		for _, t := range frozen {
-			if bounded.Err() != nil && err == bounded.Err() {
+			if bounded.Err() != nil {
 				return traceEnd(ctx, bounded, sweeps)
 			}
 			samples, err := t.Tracer.Read(bounded, t.queues)
